@@ -34,7 +34,7 @@ GSHEET_TAB    = "seen_listings"   # tab name for deduplication log
 # ─────────────────────────────────────────────
 # SCHEDULE: Mon, Thu, Sat, Sun
 # ─────────────────────────────────────────────
-RUN_ON_WEEKDAYS = {0, 3, 5, 6}
+RUN_ON_WEEKDAYS = {0, 1, 2, 3, 4, 5, 6}
 
 # ─────────────────────────────────────────────
 # TANISHQ'S RESUME (for AI fit scoring)
