@@ -34,7 +34,7 @@ GSHEET_TAB    = "seen_listings"   # tab name for deduplication log
 # ─────────────────────────────────────────────
 # SCHEDULE: Mon, Thu, Sat, Sun
 # ─────────────────────────────────────────────
-RUN_ON_WEEKDAYS = {0, 1, 2, 3, 4, 5, 6}
+RUN_ON_WEEKDAYS = {0, 3, 5, 6}
 
 # ─────────────────────────────────────────────
 # TANISHQ'S RESUME (for AI fit scoring)
@@ -909,6 +909,37 @@ def build_excel(internships, filepath):
     wb.save(filepath)
     print(f"Excel saved: {filepath}")
 
+
+# ═════════════════════════════════════════════
+# DURATION FILTER — max 4 months
+# ═════════════════════════════════════════════
+def filter_by_duration(jobs):
+    import re
+
+    def is_acceptable(d_str):
+        d = d_str.lower().strip()
+        # Keep if duration not specified — benefit of doubt
+        if any(x in d for x in ["not mentioned", "not disclosed", "n/a",
+                                  "rolling", "flexible", "part-time",
+                                  "as per", "structured"]):
+            return True
+        nums = list(map(int, re.findall(r"\d+", d)))
+        if not nums:
+            return True
+        min_num = min(nums)
+        if "year" in d:
+            return False          # 1 year+ always rejected
+        if "month" in d:
+            return min_num <= 4   # 3-6 months → min=3 → keep; 6-12 → min=6 → reject
+        if "week" in d:
+            return min_num <= 16  # 16 weeks = 4 months
+        return min_num <= 4
+
+    kept    = [j for j in jobs if is_acceptable(j.get("duration", "N/A"))]
+    removed = len(jobs) - len(kept)
+    print(f"Duration filter: removed {removed} listings over 4 months, {len(kept)} kept.")
+    return kept
+
 # ═════════════════════════════════════════════
 # SEND EMAIL
 # ═════════════════════════════════════════════
@@ -1040,6 +1071,9 @@ def run():
             seen_local.add(key)
             unique_all.append(j)
     print(f"After local dedup: {len(unique_all)} unique listings")
+
+    # ── Step 2b: Duration filter (max 4 months) ──
+    unique_all = filter_by_duration(unique_all)
 
     # ── Step 3: Cross-run dedup via Google Sheets ──
     gs_client              = get_gsheet_client()
