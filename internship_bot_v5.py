@@ -929,6 +929,7 @@ def send_email(filepath, internships, new_count):
     platform_lines = "\n".join([f"   {p}: {c}" for p, c in sorted(platform_counts.items(), key=lambda x: -x[1])])
 
     # Top picks summary for email body
+    newline = "\n"
     top_lines = ""
     for j in sorted(top_picks, key=lambda x: -x.get("fit_score", 0))[:5]:
         score    = j["fit_score"]
@@ -937,9 +938,9 @@ def send_email(filepath, internships, new_count):
         location = j["location"]
         reason   = j.get("fit_reason", "")
         link     = j["link"]
-        top_lines += f"   [{score}/10] {title} @ {company} — {location}\n"
-        top_lines += f"          ↳ {reason}\n"
-        top_lines += f"          ↳ {link}\n\n"
+        top_lines += "   [" + str(score) + "/10] " + title + " @ " + company + " — " + location + newline
+        top_lines += "          -> " + reason + newline
+        top_lines += "          -> " + link + newline + newline
 
     msg = MIMEMultipart()
     msg["From"]    = YOUR_EMAIL
@@ -996,7 +997,8 @@ Good luck!
         part = MIMEBase("application", "octet-stream")
         part.set_payload(f.read())
         encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filepath)}")
+        fname = os.path.basename(filepath)
+        part.add_header("Content-Disposition", f"attachment; filename={fname}")
         msg.attach(part)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(YOUR_EMAIL, YOUR_PASSWORD)
