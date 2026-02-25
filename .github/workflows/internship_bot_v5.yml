@@ -2,10 +2,8 @@ name: Internship Bot v5.0
 
 on:
   schedule:
-    - cron: '30 2 * * 1'   # Monday    8:00 AM IST
-    - cron: '30 2 * * 4'   # Thursday  8:00 AM IST
-    - cron: '30 2 * * 6'   # Saturday  8:00 AM IST
-    - cron: '30 2 * * 0'   # Sunday    8:00 AM IST
+  # REPLACE all 4 cron lines with just one:
+- cron: '30 2 * * *'   # Every day at 8:00 AM IST
   workflow_dispatch:         # Manual trigger from GitHub UI
 
 jobs:
