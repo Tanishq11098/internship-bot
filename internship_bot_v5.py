@@ -34,7 +34,7 @@ GSHEET_TAB    = "seen_listings"   # tab name for deduplication log
 # ─────────────────────────────────────────────
 # SCHEDULE: Mon, Thu, Sat, Sun
 # ─────────────────────────────────────────────
-RUN_ON_WEEKDAYS = {0, 3, 5, 6}
+RUN_ON_WEEKDAYS = {0, 1, 2, 3, 4, 5, 6}  # Every day
 
 # ─────────────────────────────────────────────
 # TANISHQ'S RESUME (for AI fit scoring)
@@ -292,15 +292,40 @@ def scrape_internshala():
             time.sleep(random.uniform(1, 2))
             r = requests.get(url, headers=get_headers(), timeout=15)
             soup = BeautifulSoup(r.text, "html.parser")
-            cards = soup.select(".internship_meta")[:20]
+            # Each internship container — try multiple selectors
+            cards = (soup.select(".internship_meta") or
+                     soup.select(".internship-list-item") or
+                     soup.select("[id^=internship_]"))[:20]
             for card in cards:
-                title    = card.select_one(".profile")
-                company  = card.select_one(".company_name")
-                location = card.select_one(".location_link")
-                stipend  = card.select_one(".stipend")
-                duration = card.select_one(".item_body")
-                deadline = card.select_one(".apply-by")
-                link_tag = card.find_parent("a")
+                title    = card.select_one(".profile") or card.select_one(".job-title")
+                company  = card.select_one(".company_name") or card.select_one(".company-name")
+                location = card.select_one(".location_link") or card.select_one(".locations")
+                stipend  = card.select_one(".stipend") or card.select_one(".stipend-container")
+                duration = card.select_one(".item_body") or card.select_one(".duration-container")
+                deadline = card.select_one(".apply-by") or card.select_one(".close-by")
+
+                # ── Direct job link extraction ──
+                # Internshala job URLs follow pattern: /internship/detail/SLUG
+                direct_link = None
+                # Try: href on the title anchor
+                title_a = card.select_one("a.job-title-href") or card.select_one("a[href*='/internship/detail/']")
+                if title_a and title_a.get("href"):
+                    direct_link = "https://internshala.com" + title_a["href"]
+                # Try: parent anchor of the card
+                if not direct_link:
+                    parent_a = card.find_parent("a")
+                    if parent_a and parent_a.get("href") and "/internship/" in parent_a["href"]:
+                        direct_link = "https://internshala.com" + parent_a["href"]
+                # Try: any anchor inside card pointing to internship detail
+                if not direct_link:
+                    any_a = card.select_one("a[href*='/internship/']")
+                    if any_a and any_a.get("href"):
+                        href = any_a["href"]
+                        direct_link = "https://internshala.com" + href if href.startswith("/") else href
+                # Final fallback: search page (at least narrows to category)
+                if not direct_link:
+                    direct_link = url
+
                 if title:
                     t = title.get_text(strip=True)
                     c = company.get_text(strip=True) if company else "N/A"
@@ -314,7 +339,7 @@ def scrape_internshala():
                         "posted":    "< 7 days",
                         "deadline":  deadline.get_text(strip=True).replace("Apply By:", "").strip() if deadline else "Not mentioned",
                         "status":    "Not Applied", "platform": "Internshala",
-                        "link":      "https://internshala.com" + link_tag["href"] if link_tag and link_tag.get("href") else url
+                        "link":      direct_link
                     })
         except Exception as e:
             print(f"Internshala error ({loc}): {e}")
@@ -398,7 +423,18 @@ def scrape_glassdoor():
                 link    = job.select_one("a")
                 t = title.get_text(strip=True) if title else f"{fallback} Intern"
                 c = company.get_text(strip=True) if company else "N/A"
-                href = ("https://www.glassdoor.co.in" + link["href"] if link and link.get("href") and link["href"].startswith("/") else (link["href"] if link and link.get("href") else url))
+                # Glassdoor direct link — job URLs contain /job-listing/ or /partner/
+                direct_link = url  # fallback
+                job_link = (job.select_one("a[href*='/job-listing/']") or
+                            job.select_one("a[href*='/partner/']") or
+                            job.select_one("a[data-test='job-title']") or
+                            job.select_one("a[class*='JobCard']"))
+                if job_link and job_link.get("href"):
+                    h = job_link["href"]
+                    direct_link = h if h.startswith("http") else "https://www.glassdoor.co.in" + h
+                elif link and link.get("href"):
+                    h = link["href"]
+                    direct_link = h if h.startswith("http") else "https://www.glassdoor.co.in" + h
                 d = detect_domain(t, c)
                 results.append({
                     "title": t, "company": c, "firm_type": "Corporate / MNC",
@@ -406,7 +442,7 @@ def scrape_glassdoor():
                     "location": loc.get_text(strip=True) if loc else "Delhi NCR",
                     "stipend": "Not disclosed", "duration": "3-6 Months",
                     "posted": "< 7 days", "deadline": "Not mentioned",
-                    "status": "Not Applied", "platform": "Glassdoor", "link": href
+                    "status": "Not Applied", "platform": "Glassdoor", "link": direct_link
                 })
         except Exception as e:
             print(f"Glassdoor error ({slug}): {e}")
@@ -452,7 +488,18 @@ def scrape_naukri():
                 link    = job.select_one("a.title") or job.select_one("a[href*='naukri']")
                 t = title.get_text(strip=True) if title else f"{fallback} Intern"
                 c = company.get_text(strip=True) if company else "N/A"
-                href = link["href"] if link and link.get("href") else url
+                # Naukri direct link — job URLs contain /job-listings/
+                direct_link = url  # fallback
+                if link and link.get("href"):
+                    h = link["href"]
+                    if "naukri.com" in h or h.startswith("/"):
+                        direct_link = h if h.startswith("http") else "https://www.naukri.com" + h
+                # Also try href on title element itself
+                if direct_link == url and title:
+                    title_a = title if title.name == "a" else title.find("a")
+                    if title_a and title_a.get("href"):
+                        h = title_a["href"]
+                        direct_link = h if h.startswith("http") else "https://www.naukri.com" + h
                 d = detect_domain(t, c)
                 results.append({
                     "title": t, "company": c, "firm_type": "Corporate / MNC",
@@ -461,7 +508,7 @@ def scrape_naukri():
                     "stipend": "Not disclosed", "duration": "3-6 Months",
                     "posted": "< 7 days", "deadline": "Not mentioned",
                     "status": "Not Applied", "platform": "Naukri",
-                    "link": href if href.startswith("http") else f"https://www.naukri.com/{slug}"
+                    "link": direct_link
                 })
         except Exception as e:
             print(f"Naukri error ({slug}): {e}")
@@ -496,7 +543,18 @@ def scrape_foundit():
                 link    = job.select_one("a")
                 t = title.get_text(strip=True) if title else f"{fallback} Intern"
                 c = company.get_text(strip=True) if company else "N/A"
-                href = ("https://www.foundit.in" + link["href"] if link and link.get("href") and link["href"].startswith("/") else (link["href"] if link and link.get("href") else url))
+                # Foundit direct link — job URLs contain /j/ or /job/
+                direct_link = url  # fallback
+                job_link = (job.select_one("a[href*='/j/']") or
+                            job.select_one("a[href*='/job/']") or
+                            job.select_one("a.jobTitle") or
+                            job.select_one("a[href*='foundit']"))
+                if job_link and job_link.get("href"):
+                    h = job_link["href"]
+                    direct_link = h if h.startswith("http") else "https://www.foundit.in" + h
+                elif link and link.get("href"):
+                    h = link["href"]
+                    direct_link = h if h.startswith("http") else "https://www.foundit.in" + h
                 d = detect_domain(t, c)
                 results.append({
                     "title": t, "company": c, "firm_type": "Corporate",
@@ -504,7 +562,7 @@ def scrape_foundit():
                     "location": loc.get_text(strip=True) if loc else "Delhi NCR",
                     "stipend": "Not disclosed", "duration": "3-6 Months",
                     "posted": "< 7 days", "deadline": "Not mentioned",
-                    "status": "Not Applied", "platform": "Foundit", "link": href
+                    "status": "Not Applied", "platform": "Foundit", "link": direct_link
                 })
         except Exception as e:
             print(f"Foundit error ({keyword}): {e}")
@@ -543,7 +601,18 @@ def scrape_jobaaj():
                 link    = job.select_one("a")
                 t = title.get_text(strip=True) if title else f"{fallback} Intern"
                 c = company.get_text(strip=True) if company else "N/A"
-                href = ("https://www.jobaaj.com" + link["href"] if link and link.get("href") and link["href"].startswith("/") else (link["href"] if link and link.get("href") else url))
+                # Jobaaj direct link — job URLs contain /job/
+                direct_link = url  # fallback
+                job_link = (job.select_one("a[href*='/job/']") or
+                            job.select_one("a.job-title") or
+                            job.select_one("h2 > a") or
+                            job.select_one("h3 > a"))
+                if job_link and job_link.get("href"):
+                    h = job_link["href"]
+                    direct_link = h if h.startswith("http") else "https://www.jobaaj.com" + h
+                elif link and link.get("href"):
+                    h = link["href"]
+                    direct_link = h if h.startswith("http") else "https://www.jobaaj.com" + h
                 d = detect_domain(t, c)
                 results.append({
                     "title": t, "company": c, "firm_type": "Corporate / MNC",
@@ -552,7 +621,7 @@ def scrape_jobaaj():
                     "stipend": "Not disclosed", "duration": "3-6 Months",
                     "posted": "< 7 days", "deadline": "Not mentioned",
                     "status": "Not Applied", "platform": "Jobaaj",
-                    "link": href if href.startswith("http") else url
+                    "link": direct_link
                 })
         except Exception as e:
             print(f"Jobaaj error ({url}): {e}")
@@ -610,12 +679,17 @@ def scrape_wellfound():
                 c = company.get_text(strip=True) if company else "Startup"
 
                 # Build absolute href
-                if link and link.get("href"):
-                    raw_href = link["href"]
-                    href = ("https://wellfound.com" + raw_href
-                            if raw_href.startswith("/") else raw_href)
-                else:
-                    href = url
+                # Wellfound direct link — job URLs contain /jobs/ or /l/
+                direct_link = url
+                job_link = (job.select_one("a[href*='/jobs/']") or
+                            job.select_one("a[href*='/job/']") or
+                            job.select_one("a[class*='JobTitle']") or
+                            link)
+                if job_link and job_link.get("href"):
+                    raw_href = job_link["href"]
+                    direct_link = ("https://wellfound.com" + raw_href
+                                   if raw_href.startswith("/") else raw_href)
+                href = direct_link
 
                 d = detect_domain(t, c)
                 results.append({
@@ -696,11 +770,17 @@ def scrape_iimjobs():
                 link    = job.select_one("a")
                 t = title.get_text(strip=True)   if title   else f"{fallback} Intern"
                 c = company.get_text(strip=True) if company else "N/A"
-                if link and link.get("href"):
-                    href = ("https://www.iimjobs.com" + link["href"]
-                            if link["href"].startswith("/") else link["href"])
-                else:
-                    href = url
+                # IIMJobs direct link — job URLs contain /j/ 
+                direct_link = url
+                job_link = (job.select_one("a[href*='/j/']") or
+                            job.select_one("a.job-title") or
+                            job.select_one("h2 > a") or
+                            job.select_one("a[href*='iimjobs']") or
+                            link)
+                if job_link and job_link.get("href"):
+                    h = job_link["href"]
+                    direct_link = h if h.startswith("http") else "https://www.iimjobs.com" + h
+                href = direct_link
                 d = detect_domain(t, c)
                 results.append({
                     "title":     t, "company": c,
@@ -809,6 +889,133 @@ def scrape_company_careers():
             print(f"Career page error ({company_name}): {e}")
 
     print(f"Company Careers: {len(results)} results")
+    return results
+
+
+# ═════════════════════════════════════════════
+# SOURCE 10: UNSTOP (formerly Dare2Compete)
+# ═════════════════════════════════════════════
+def scrape_unstop():
+    """
+    Unstop is huge for college students — internships,
+    competitions, and case challenges all in one place.
+    Especially strong for consulting, strategy, and finance roles.
+    """
+    results = []
+    searches = [
+        ("finance", "Finance Operations"),
+        ("investment-banking", "Investment Banking"),
+        ("strategy", "Strategy & Consulting"),
+        ("consulting", "Strategy & Consulting"),
+        ("operations", "Operations / Growth"),
+        ("founder", "Founder's Office"),
+        ("equity-research", "Equity Research"),
+        ("management-trainee", "Management Trainee"),
+        ("fintech", "Fintech / Payments"),
+        ("business-development", "Operations / Growth"),
+    ]
+    for keyword, fallback in searches:
+        try:
+            time.sleep(random.uniform(2, 3))
+            url = f"https://unstop.com/internships?domain={keyword}&location=Delhi"
+            r   = requests.get(url, headers=get_headers(), timeout=20)
+            soup = BeautifulSoup(r.text, "html.parser")
+            jobs = (soup.select(".opportunity-card") or
+                    soup.select(".card-wrapper") or
+                    soup.select("[class*='opportunityCard']") or
+                    soup.select("div[class*='card']"))
+            for job in jobs[:8]:
+                title   = (job.select_one("[class*='title']") or
+                           job.select_one("h2") or job.select_one("h3"))
+                company = (job.select_one("[class*='company']") or
+                           job.select_one("[class*='org']") or
+                           job.select_one("h4"))
+                loc     = (job.select_one("[class*='location']") or
+                           job.select_one("[class*='city']"))
+                stipend = (job.select_one("[class*='stipend']") or
+                           job.select_one("[class*='salary']"))
+                dur     = (job.select_one("[class*='duration']") or
+                           job.select_one("[class*='tenure']"))
+                # Direct link extraction
+                direct_link = url
+                job_link = (job.select_one("a[href*='/internship/']") or
+                            job.select_one("a[href*='/opportunity/']") or
+                            job.select_one("a[href*='unstop.com']") or
+                            job.select_one("a"))
+                if job_link and job_link.get("href"):
+                    h = job_link["href"]
+                    direct_link = h if h.startswith("http") else "https://unstop.com" + h
+
+                t = title.get_text(strip=True)   if title   else f"{fallback} Intern"
+                c = company.get_text(strip=True) if company else "N/A"
+                d = detect_domain(t, c)
+                results.append({
+                    "title":     t, "company": c,
+                    "firm_type": "Startup / Corporate",
+                    "domain":    d if d != "Finance Operations" else fallback,
+                    "location":  loc.get_text(strip=True)     if loc     else "Delhi NCR",
+                    "stipend":   stipend.get_text(strip=True) if stipend else "Not disclosed",
+                    "duration":  dur.get_text(strip=True)     if dur     else "Not mentioned",
+                    "posted":    "< 7 days",
+                    "deadline":  "Not mentioned",
+                    "status":    "Not Applied",
+                    "platform":  "Unstop",
+                    "link":      direct_link
+                })
+        except Exception as e:
+            print(f"Unstop error ({keyword}): {e}")
+    print(f"Unstop: {len(results)} results")
+    return results
+
+
+# ═════════════════════════════════════════════
+# LINKEDIN SEARCH URLs (direct filtered links)
+# ═════════════════════════════════════════════
+def get_linkedin_urls():
+    """
+    LinkedIn blocks scraping so we generate pre-filtered
+    search URLs that open directly to relevant listings.
+    One click = filtered LinkedIn search for that domain.
+    """
+    base = "https://www.linkedin.com/jobs/search/?keywords="
+    loc  = "&location=Delhi%20NCR%2C%20India&f_E=1&f_JT=I&sortBy=DD"
+    # f_E=1 = Entry level, f_JT=I = Internship, sortBy=DD = Most recent
+
+    linkedin_searches = [
+        ("Founder%27s+Office+Intern",        "Founder's Office"),
+        ("Management+Trainee+Finance",        "Management Trainee"),
+        ("Investment+Banking+Intern",         "Investment Banking"),
+        ("Equity+Research+Intern",            "Equity Research"),
+        ("Strategy+Consulting+Intern",        "Strategy & Consulting"),
+        ("Operations+Growth+Intern",          "Operations / Growth"),
+        ("Financial+Analyst+Intern",          "Finance Operations"),
+        ("Private+Equity+Intern",             "Private Equity"),
+        ("Venture+Capital+Intern",            "Venture Capital"),
+        ("Fintech+Intern",                    "Fintech / Payments"),
+        ("Valuation+Analyst+Intern",          "Valuation"),
+        ("Credit+Analyst+Intern",             "Credit / Debt"),
+        ("Audit+Intern",                      "Audit / Assurance"),
+        ("Wealth+Management+Intern",          "Wealth Management"),
+        ("Chief+of+Staff+Intern",             "Founder's Office"),
+    ]
+
+    results = []
+    for query, domain in linkedin_searches:
+        results.append({
+            "title":     "LinkedIn Search — " + domain,
+            "company":   "Multiple Companies",
+            "firm_type": "Various",
+            "domain":    domain,
+            "location":  "Delhi NCR",
+            "stipend":   "Various",
+            "duration":  "Not mentioned",
+            "posted":    "Live Search",
+            "deadline":  "Click to see",
+            "status":    "Not Applied",
+            "platform":  "LinkedIn",
+            "link":      base + query + loc
+        })
+    print(f"LinkedIn URLs: {len(results)} search links generated")
     return results
 
 # ═════════════════════════════════════════════
@@ -1167,6 +1374,66 @@ def build_excel(internships, filepath):
         ws3.column_dimensions[get_column_letter(col)].width = w
     ws3.freeze_panes = "A3"
 
+    # ── Sheet 7: LinkedIn Search URLs ────────────────────────────────
+    ws_li = wb.create_sheet("LinkedIn Search URLs")
+    ws_li.merge_cells("A1:D1")
+    ws_li["A1"] = f"LinkedIn Direct Search Links — {today} (Click to open filtered results)"
+    ws_li["A1"].font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    ws_li["A1"].fill = PatternFill("solid", start_color="0A66C2")
+    ws_li["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws_li.row_dimensions[1].height = 28
+
+    li_headers = ["Domain", "Search Link", "Filter Applied", "Tip"]
+    li_tips = {
+        "Founder's Office": "Sort by Most Recent, apply within 24hrs",
+        "Investment Banking": "Target boutique IB firms for better response rate",
+        "Equity Research": "Mention SEBI NISM cert in first line of message",
+        "Strategy & Consulting": "Reference McKinsey Forward in your message",
+        "Operations / Growth": "Highlight 23 Ventures hackathon experience",
+        "Management Trainee": "Apply to FMCG and conglomerate MT programs",
+        "Private Equity": "Cold email is better than applying online for PE",
+        "Venture Capital": "Mention startup credits from 23 Ventures",
+        "Fintech / Payments": "Focus on product-facing finance roles",
+        "Valuation": "Highlight DCF and financial modeling in headline",
+        "Credit / Debt": "NBFC roles are more accessible than bank roles",
+        "Audit / Assurance": "Big 4 has structured internship programs",
+        "Wealth Management": "SEBI NISM cert is a strong differentiator",
+        "Finance Operations": "Good stepping stone — builds domain experience",
+    }
+
+    for col, h in enumerate(li_headers, 1):
+        cell = ws_li.cell(2, col, h)
+        cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        cell.fill = PatternFill("solid", start_color="0A66C2")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = thin
+    ws_li.row_dimensions[2].height = 25
+
+    li_jobs = [j for j in internships if j.get("platform") == "LinkedIn"]
+    for i, job in enumerate(li_jobs, 1):
+        r      = i + 2
+        row_bg = "EEF3FB" if i % 2 != 0 else "FFFFFF"
+        domain = job.get("domain", "")
+        tip    = li_tips.get(domain, "Apply within 24hrs of posting for best response")
+
+        vals = [domain, job.get("link", ""), "Entry Level | Internship | Delhi NCR | Recent", tip]
+        for col, val in enumerate(vals, 1):
+            cell = ws_li.cell(r, col, val)
+            cell.font = (Font(name="Arial", size=9, color="0A66C2", underline="single")
+                        if col == 2 else Font(name="Arial", size=9))
+            cell.fill = PatternFill("solid", start_color=row_bg)
+            cell.border = thin
+            cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            if col == 2 and val:
+                cell.hyperlink = val
+        ws_li.row_dimensions[r].height = 30
+
+    ws_li.column_dimensions["A"].width = 26
+    ws_li.column_dimensions["B"].width = 60
+    ws_li.column_dimensions["C"].width = 34
+    ws_li.column_dimensions["D"].width = 48
+    ws_li.freeze_panes = "A3"
+
     wb.save(filepath)
     print(f"Excel saved: {filepath}")
 
@@ -1244,13 +1511,13 @@ def send_email(filepath, internships, new_count):
 
     body = f"""Hi Tanishq,
 
-Your Internship Bot v6.0 report is ready!
+Your Internship Bot v7.0 report is ready!
 
 DATE      : {today_str}
 NEW TODAY : {new_count} listings (not seen before)
 TOTAL     : {total} internships (including recurring)
 LOCATION  : Delhi / Gurugram / Noida / Greater Noida
-SCHEDULE  : Runs every Monday, Thursday, Saturday & Sunday
+SCHEDULE  : Runs every day at 8:00 AM IST
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🌟 TOP PICKS FOR YOU (AI Score 9+/10)
@@ -1264,13 +1531,14 @@ DOMAIN BREAKDOWN:
 {domain_lines}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EXCEL HAS 6 SHEETS:
+EXCEL HAS 7 SHEETS:
   Sheet 1 — All Internships (sorted by AI Fit Score, color coded)
   Sheet 2 — Top Picks (Fit Score 7+, best matches for you)
   Sheet 3 — 3-Month Internships (short, focused internships)
   Sheet 4 — 4-Month Internships (slightly longer internships)
   Sheet 5 — Domain Summary (count per domain + platforms)
   Sheet 6 — Application Tracker (track your progress)
+  Sheet 7 — LinkedIn Search URLs (direct filtered links)
 
 AI FIT SCORE is based on your resume:
   BBA Finance & Banking | SEBI NISM | McKinsey Forward
@@ -1284,10 +1552,10 @@ HOW TO USE:
   4. Use Sheet 4 to track interview progress
 
 Good luck!
--- Internship Bot v5.0 (GitHub Actions)
-   Sources: Internshala + Indeed + Glassdoor + Naukri + Foundit + Jobaaj + Wellfound + IIMJobs + Company Careers
+-- Internship Bot v7.0 (GitHub Actions)
+   Sources: Internshala + Indeed + Glassdoor + Naukri + Foundit + Jobaaj + Wellfound + IIMJobs + Company Careers + Unstop + LinkedIn URLs
    Dedup: Google Sheets | AI Scoring: Claude API
-   Schedule: Mon / Thu / Sat / Sun
+   Schedule: Every day at 8:00 AM IST
 """
     msg.attach(MIMEText(body, "plain"))
     with open(filepath, "rb") as f:
@@ -1397,6 +1665,136 @@ def filter_by_stipend(jobs):
     print(f"Stipend filter: removed {removed} listings below Rs.8,000/mo, {len(kept)} kept.")
     return kept
 
+
+# ═════════════════════════════════════════════
+# WEEKLY STRATEGIC REPORT (Sundays only)
+# ═════════════════════════════════════════════
+def send_weekly_report(internships, gs_client):
+    """
+    Every Sunday, send a strategic AI-generated report analyzing:
+    - Which domains have most opportunities
+    - Which platforms performed best
+    - Tier 1 company count
+    - Strategic recommendations for the coming week
+    """
+    today_weekday = date.today().weekday()
+    if today_weekday != 6:  # 6 = Sunday
+        return
+
+    print("Sunday detected — generating weekly strategic report...")
+    today_str = date.today().strftime("%B %d, %Y")
+
+    # ── Gather stats ──
+    domain_counts   = {}
+    platform_counts = {}
+    tier_counts     = {}
+    high_fit        = []
+
+    for job in internships:
+        d = job.get("domain", "Finance Operations")
+        p = job.get("platform", "Other")
+        t = job.get("tier", "Tier 3")
+        domain_counts[d]   = domain_counts.get(d, 0) + 1
+        platform_counts[p] = platform_counts.get(p, 0) + 1
+        tier_counts[t]     = tier_counts.get(t, 0) + 1
+        if job.get("fit_score", 0) >= 8:
+            high_fit.append(job)
+
+    top_domains   = sorted(domain_counts.items(),   key=lambda x: -x[1])[:5]
+    top_platforms = sorted(platform_counts.items(), key=lambda x: -x[1])[:5]
+    tier1_count   = tier_counts.get("Tier 1", 0)
+    tier2_count   = tier_counts.get("Tier 2", 0)
+
+    # ── Build stats text for Claude ──
+    stats_text = "Domain breakdown: " + ", ".join([d + ": " + str(c) for d, c in top_domains])
+    stats_text += ". Platform breakdown: " + ", ".join([p + ": " + str(c) for p, c in top_platforms])
+    stats_text += ". Tier 1 companies: " + str(tier1_count)
+    stats_text += ". High fit listings (8+): " + str(len(high_fit))
+    stats_text += ". Total listings this week: " + str(len(internships))
+
+    top_picks_text = ""
+    for j in sorted(high_fit, key=lambda x: -x.get("fit_score", 0))[:10]:
+        score   = j.get("fit_score", 0)
+        title   = j.get("title", "")
+        company = j.get("company", "")
+        domain  = j.get("domain", "")
+        tier    = j.get("tier", "")
+        top_picks_text += str(score) + "/10 — " + title + " @ " + company + " (" + domain + ", " + tier + ")\n"
+
+    # ── Ask Claude for strategic recommendations ──
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    prompt = """You are a career advisor for a college student urgently looking for internships.
+
+CANDIDATE: Tanishq Singhal
+- BBA Finance & Banking, 2nd year, IMS UCC Ghaziabad
+- SEBI NISM certified, McKinsey Forward Program, IIT Guwahati Winter Consulting Top 10%
+- Experience: Finance Intern at Yhills, Founder Fellow at 23 Ventures
+- Skills: Financial Modeling, Excel, Power BI, Strategy, Leadership
+- Goal: Land internship within 60 days
+- Best fit domains: Founder's Office, Strategy & Consulting, Investment Banking, Equity Research
+
+THIS WEEK'S INTERNSHIP DATA:
+""" + stats_text + """
+
+TOP LISTINGS THIS WEEK:
+""" + top_picks_text + """
+
+Write a concise weekly strategic report (plain text, no markdown) with:
+1. WEEK SUMMARY — key observations about this week's listings in 2-3 sentences
+2. TOP 3 DOMAINS TO FOCUS ON — which domains to prioritize this week and why
+3. BEST PLATFORM THIS WEEK — which platform gave best results and why
+4. ACTION PLAN — 5 specific actions Tanishq should take this coming week
+5. SKILL GAP ALERT — any skills repeatedly appearing in listings that Tanishq should highlight or develop
+
+Keep it practical, specific, and motivating. Max 400 words."""
+
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        report_text = response.content[0].text.strip()
+    except Exception as e:
+        report_text = "AI report generation failed: " + str(e)
+        print(report_text)
+
+    # ── Send separate weekly report email ──
+    msg = MIMEMultipart()
+    msg["From"]    = YOUR_EMAIL
+    msg["To"]      = SEND_TO_EMAIL
+    msg["Subject"] = "📊 Weekly Internship Strategy Report — " + today_str
+
+    nl = "\n"
+    body = ("Hi Tanishq," + nl + nl +
+            "Your Weekly Strategic Internship Report is ready!" + nl + nl +
+            "=" * 50 + nl +
+            "WEEKLY STATS SNAPSHOT" + nl +
+            "=" * 50 + nl +
+            "Total listings this week : " + str(len(internships)) + nl +
+            "High fit listings (8+/10): " + str(len(high_fit)) + nl +
+            "Tier 1 companies         : " + str(tier1_count) + nl +
+            "Tier 2 companies         : " + str(tier2_count) + nl + nl +
+            "Top domains:" + nl +
+            nl.join(["  " + d + ": " + str(c) + " listings" for d, c in top_domains]) + nl + nl +
+            "Top platforms:" + nl +
+            nl.join(["  " + p + ": " + str(c) + " listings" for p, c in top_platforms]) + nl + nl +
+            "=" * 50 + nl +
+            "AI STRATEGIC REPORT" + nl +
+            "=" * 50 + nl +
+            report_text + nl + nl +
+            "=" * 50 + nl +
+            "TOP LISTINGS TO APPLY THIS WEEK" + nl +
+            "=" * 50 + nl +
+            top_picks_text + nl +
+            "-- Internship Bot v7.0 | Weekly Report every Sunday" + nl)
+
+    msg.attach(MIMEText(body, "plain"))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(YOUR_EMAIL, YOUR_PASSWORD)
+        server.sendmail(YOUR_EMAIL, SEND_TO_EMAIL, msg.as_string())
+    print("Weekly strategic report sent!")
+
 # ═════════════════════════════════════════════
 # MAIN
 # ═════════════════════════════════════════════
@@ -1405,7 +1803,7 @@ def run():
     today_weekday = date.today().weekday()
     if today_weekday not in RUN_ON_WEEKDAYS:
         day_name = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][today_weekday]
-        print(f"Skipping — today is {day_name}. Bot runs Mon / Thu / Sat / Sun only.")
+        print(f"Skipping — today is {day_name}. Bot runs every day.")
         return
 
     print("Starting Internship Bot v6.0...")
@@ -1420,7 +1818,9 @@ def run():
     all_jobs += scrape_jobaaj()
     all_jobs += scrape_wellfound()
     all_jobs += scrape_iimjobs()           # NEW
-    all_jobs += scrape_company_careers()   # NEW
+    all_jobs += scrape_company_careers()
+    all_jobs += scrape_unstop()              # NEW
+    all_jobs += get_linkedin_urls()          # NEW
     all_jobs += get_quality_listings()
 
     # ── Step 2: Local dedup (same run) ──
@@ -1463,6 +1863,10 @@ def run():
     filepath  = f"/tmp/Internships_Tanishq_{today_str}.xlsx"
     build_excel(jobs_to_report, filepath)
     send_email(filepath, jobs_to_report, new_count)
+
+    # ── Step 6: Weekly strategic report (Sundays only) ──
+    send_weekly_report(jobs_to_report, gs_client)
+
     print(f"Done! {len(jobs_to_report)} total listings, {new_count} new this run.")
 
 if __name__ == "__main__":
