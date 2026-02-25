@@ -931,9 +931,15 @@ def send_email(filepath, internships, new_count):
     # Top picks summary for email body
     top_lines = ""
     for j in sorted(top_picks, key=lambda x: -x.get("fit_score", 0))[:5]:
-        top_lines += f"   [{j['fit_score']}/10] {j['title']} @ {j['company']} — {j['location']}\n"
-        top_lines += f"          ↳ {j.get('fit_reason','')}\n"
-        top_lines += f"          ↳ {j['link']}\n\n"
+        score    = j["fit_score"]
+        title    = j["title"]
+        company  = j["company"]
+        location = j["location"]
+        reason   = j.get("fit_reason", "")
+        link     = j["link"]
+        top_lines += f"   [{score}/10] {title} @ {company} — {location}\n"
+        top_lines += f"          ↳ {reason}\n"
+        top_lines += f"          ↳ {link}\n\n"
 
     msg = MIMEMultipart()
     msg["From"]    = YOUR_EMAIL
