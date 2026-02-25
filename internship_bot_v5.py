@@ -34,7 +34,7 @@ GSHEET_TAB    = "seen_listings"   # tab name for deduplication log
 # ─────────────────────────────────────────────
 # SCHEDULE: Mon, Thu, Sat, Sun
 # ─────────────────────────────────────────────
-RUN_ON_WEEKDAYS = {0, 1, 2, 3, 4, 5, 6}
+RUN_ON_WEEKDAYS = {0, 3, 5, 6}
 
 # ─────────────────────────────────────────────
 # TANISHQ'S RESUME (for AI fit scoring)
@@ -660,6 +660,157 @@ def get_quality_listings():
         {"title":"KPO Financial Analyst Intern","company":"Undisclosed KPO","firm_type":"KPO Finance","domain":"KPO Finance","location":"Noida, UP","stipend":"Rs.10,000-12,000/mo","duration":"3-6 Months","posted":"Active","deadline":"Rolling","status":"Not Applied","platform":"Naukri","link":"https://www.naukri.com/kpo-internship-jobs-in-noida"},
     ]
 
+
+# ═════════════════════════════════════════════
+# SOURCE 8: IIM JOBS
+# ═════════════════════════════════════════════
+def scrape_iimjobs():
+    results = []
+    searches = [
+        ("finance-internship", "Finance Operations"),
+        ("investment-banking-internship", "Investment Banking"),
+        ("equity-research-internship", "Equity Research"),
+        ("strategy-internship", "Strategy & Consulting"),
+        ("consulting-internship", "Strategy & Consulting"),
+        ("founders-office-internship", "Founder's Office"),
+        ("management-trainee", "Management Trainee"),
+        ("operations-internship", "Operations / Growth"),
+        ("private-equity-internship", "Private Equity"),
+        ("audit-internship", "Audit / Assurance"),
+    ]
+    for slug, fallback in searches:
+        try:
+            time.sleep(random.uniform(2, 3))
+            url = f"https://www.iimjobs.com/j/{slug}-jobs"
+            r   = requests.get(url, headers=get_headers(), timeout=15)
+            soup = BeautifulSoup(r.text, "html.parser")
+            jobs = (soup.select(".job-container") or
+                    soup.select(".job_list_item") or
+                    soup.select("li.clearfix"))
+            for job in jobs[:8]:
+                title   = (job.select_one(".job-title") or
+                           job.select_one("h2") or job.select_one("a.job-title"))
+                company = (job.select_one(".company-name") or
+                           job.select_one(".comp-name") or job.select_one("h3"))
+                loc     = job.select_one(".loc") or job.select_one(".location")
+                link    = job.select_one("a")
+                t = title.get_text(strip=True)   if title   else f"{fallback} Intern"
+                c = company.get_text(strip=True) if company else "N/A"
+                if link and link.get("href"):
+                    href = ("https://www.iimjobs.com" + link["href"]
+                            if link["href"].startswith("/") else link["href"])
+                else:
+                    href = url
+                d = detect_domain(t, c)
+                results.append({
+                    "title":     t, "company": c,
+                    "firm_type": "Corporate / MNC",
+                    "domain":    d if d != "Finance Operations" else fallback,
+                    "location":  loc.get_text(strip=True) if loc else "Delhi NCR",
+                    "stipend":   "Not disclosed",
+                    "duration":  "3-6 Months",
+                    "posted":    "< 7 days",
+                    "deadline":  "Not mentioned",
+                    "status":    "Not Applied",
+                    "platform":  "IIMJobs",
+                    "link":      href
+                })
+        except Exception as e:
+            print(f"IIMJobs error ({slug}): {e}")
+    print(f"IIMJobs: {len(results)} results")
+    return results
+
+
+# ═════════════════════════════════════════════
+# SOURCE 9: COMPANY CAREER PAGES (Direct)
+# ═════════════════════════════════════════════
+def scrape_company_careers():
+    """
+    Scrape top startup & corporate career pages directly.
+    These roles often never appear on job boards.
+    """
+    results = []
+
+    career_pages = [
+        # Fintech / Startups
+        ("https://careers.cred.club/openings", "CRED", "Fintech / Payments"),
+        ("https://zepto.keka.com/careers", "Zepto", "Operations / Growth"),
+        ("https://groww.in/blog/careers", "Groww", "Fintech / Payments"),
+        ("https://razorpay.com/jobs/", "Razorpay", "Fintech / Payments"),
+        ("https://meesho.io/jobs", "Meesho", "Operations / Growth"),
+        ("https://www.phonepe.com/en/careers.html", "PhonePe", "Fintech / Payments"),
+        # Consulting / Strategy
+        ("https://careers.bcg.com/global/en/search-results?keywords=intern&location=India",
+         "BCG", "Strategy & Consulting"),
+        ("https://www.mckinsey.com/careers/search-jobs?query=intern&location=India",
+         "McKinsey", "Strategy & Consulting"),
+        # Finance
+        ("https://www.hdfcbank.com/content/bbp/repositories/723fb80a-2dde-42a3-9793-7ae1be57c87f/?folderPath=/footer/Careers/",
+         "HDFC Bank", "Investment Banking"),
+        ("https://jobs.goldmansachs.com/jobs?search=intern&location=india",
+         "Goldman Sachs", "Investment Banking"),
+    ]
+
+    # Generic selectors to try across different career pages
+    title_selectors   = ["h2", "h3", ".job-title", ".position-title",
+                         ".opening-title", "[class*=title]", "a[href*=job]"]
+    company_selectors = [".company", "h4", "[class*=company]"]
+    link_selectors    = ["a[href*=job]", "a[href*=career]",
+                         "a[href*=opening]", "a[href*=position]"]
+
+    for url, company_name, fallback_domain in career_pages:
+        try:
+            time.sleep(random.uniform(2, 3.5))
+            r    = requests.get(url, headers=get_headers(), timeout=20)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Try each title selector
+            jobs_found = []
+            for sel in title_selectors:
+                items = soup.select(sel)
+                if items:
+                    jobs_found = items[:6]
+                    break
+
+            for item in jobs_found:
+                t = item.get_text(strip=True)
+                if len(t) < 5 or len(t) > 120:
+                    continue
+                if not any(kw in t.lower() for kw in [
+                    "intern", "trainee", "analyst", "associate",
+                    "finance", "strategy", "operations", "founder"
+                ]):
+                    continue
+
+                # Find link
+                link = item.find("a") or item.find_parent("a")
+                if link and link.get("href"):
+                    href = (url.split("/")[0] + "//" + url.split("/")[2] + link["href"]
+                            if link["href"].startswith("/") else link["href"])
+                else:
+                    href = url
+
+                d = detect_domain(t, company_name)
+                results.append({
+                    "title":     t,
+                    "company":   company_name,
+                    "firm_type": "Direct — Company Career Page",
+                    "domain":    d if d != "Finance Operations" else fallback_domain,
+                    "location":  "Delhi NCR",
+                    "stipend":   "Not disclosed",
+                    "duration":  "Not mentioned",
+                    "posted":    "Active",
+                    "deadline":  "Not mentioned",
+                    "status":    "Not Applied",
+                    "platform":  "Company Careers",
+                    "link":      href
+                })
+        except Exception as e:
+            print(f"Career page error ({company_name}): {e}")
+
+    print(f"Company Careers: {len(results)} results")
+    return results
+
 # ═════════════════════════════════════════════
 # BUILD EXCEL  (now with Fit Score column)
 # ═════════════════════════════════════════════
@@ -697,9 +848,9 @@ def build_excel(internships, filepath):
     ws["A2"].alignment = Alignment(horizontal="left", wrap_text=True)
     ws.row_dimensions[2].height = 30
 
-    headers = ["#", "Role / Internship Title", "Company", "Firm Type", "Domain", "Location",
-               "Stipend", "Duration", "Posted", "Deadline", "Platform", "Apply Link",
-               "Status", "AI Fit Score", "Why It Fits (AI)", "Notes"]
+    headers = ["#", "Role / Internship Title", "Company", "Tier", "Firm Type", "Domain",
+               "Location", "Stipend", "Duration", "Posted", "Deadline", "Platform",
+               "Apply Link", "Status", "AI Fit Score", "Why It Fits (AI)", "Notes"]
     ws.append(headers)
     for col in range(1, len(headers) + 1):
         cell = ws.cell(row=3, column=col)
@@ -761,7 +912,7 @@ def build_excel(internships, filepath):
                 cell.fill = PatternFill("solid", start_color=row_bg)
         ws.row_dimensions[r].height = 40
 
-    col_widths = [4, 38, 26, 24, 24, 24, 20, 14, 12, 18, 14, 50, 16, 12, 38, 20]
+    col_widths = [4, 38, 26, 10, 24, 24, 22, 20, 14, 12, 18, 14, 50, 16, 12, 38, 20]
     for col, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = w
     ws.freeze_panes = "A4"
@@ -1093,7 +1244,7 @@ def send_email(filepath, internships, new_count):
 
     body = f"""Hi Tanishq,
 
-Your Internship Bot v5.0 report is ready!
+Your Internship Bot v6.0 report is ready!
 
 DATE      : {today_str}
 NEW TODAY : {new_count} listings (not seen before)
@@ -1134,7 +1285,7 @@ HOW TO USE:
 
 Good luck!
 -- Internship Bot v5.0 (GitHub Actions)
-   Sources: Internshala + Indeed + Glassdoor + Naukri + Foundit + Jobaaj + Wellfound
+   Sources: Internshala + Indeed + Glassdoor + Naukri + Foundit + Jobaaj + Wellfound + IIMJobs + Company Careers
    Dedup: Google Sheets | AI Scoring: Claude API
    Schedule: Mon / Thu / Sat / Sun
 """
@@ -1151,6 +1302,101 @@ Good luck!
         server.sendmail(YOUR_EMAIL, SEND_TO_EMAIL, msg.as_string())
     print("Email sent!")
 
+
+# ═════════════════════════════════════════════
+# COMPANY TIER TAGGING
+# ═════════════════════════════════════════════
+TIER1_COMPANIES = {
+    # Big 4 & Global Consulting
+    "pwc", "deloitte", "kpmg", "ey", "ernst", "mckinsey", "bcg", "bain",
+    "accenture", "oliver wyman", "roland berger",
+    # Global Banks & Finance
+    "goldman sachs", "morgan stanley", "jp morgan", "jpmorgan", "hsbc",
+    "barclays", "citibank", "citi", "deutsche bank", "ubs", "credit suisse",
+    "blackrock", "vanguard", "fidelity",
+    # Top Indian Finance
+    "kotak", "hdfc", "icici", "axis bank", "sbi", "sebi", "rbi",
+    "edelweiss", "motilal oswal", "iifl", "angel broking", "zerodha",
+    # Top Indian Startups (unicorns)
+    "cred", "zepto", "groww", "razorpay", "phonepe", "paytm", "meesho",
+    "swiggy", "zomato", "ola", "nykaa", "mamaearth", "boat",
+    "dream11", "games24x7", "mpl", "unacademy", "byju",
+    # PE / VC
+    "sequoia", "accel", "tiger global", "softbank", "general atlantic",
+    "warburg pincus", "carlyle", "blackstone", "kkr",
+}
+
+TIER2_COMPANIES = {
+    # Mid-tier consulting & finance
+    "wns", "genpact", "mphasis", "hexaware", "niit", "firstsource",
+    "ujjivan", "bandhan", "au small finance", "suryoday",
+    "avendus", "o3 capital", "veda corporate", "anand rathi",
+    "sharekhan", "5paisa", "upstox", "coin", "dhan",
+    # Mid startups
+    "travelclan", "cleartax", "zoho", "freshworks", "chargebee",
+    "postman", "browserstack", "darwinbox", "leadsquared",
+    "lendingkart", "capital float", "indifi", "yubi", "credavenue",
+}
+
+def tag_company_tier(company_name):
+    c = company_name.lower().strip()
+    if any(t in c for t in TIER1_COMPANIES):
+        return "Tier 1"
+    if any(t in c for t in TIER2_COMPANIES):
+        return "Tier 2"
+    return "Tier 3"
+
+def apply_tier_tags(jobs):
+    for job in jobs:
+        job["tier"] = tag_company_tier(job.get("company", ""))
+    tier_counts = {}
+    for job in jobs:
+        t = job["tier"]
+        tier_counts[t] = tier_counts.get(t, 0) + 1
+    print(f"Tier tagging: {tier_counts}")
+    return jobs
+
+
+# ═════════════════════════════════════════════
+# STIPEND FILTER — minimum Rs.8,000/month
+# ═════════════════════════════════════════════
+def filter_by_stipend(jobs):
+    """
+    Remove listings with stipend clearly below Rs.8,000/mo.
+    Keep if stipend is not disclosed (can't confirm it's low).
+    """
+    import re
+
+    def is_acceptable_stipend(stipend_str):
+        s = stipend_str.lower().strip()
+
+        # Keep if not disclosed — benefit of doubt
+        if any(x in s for x in ["not disclosed", "not mentioned", "as per",
+                                  "negotiable", "competitive", "as per norms",
+                                  "industry standard", "incentive"]):
+            return True
+
+        # Extract all numbers
+        nums = re.findall(r"[\d,]+", s)
+        nums = [int(n.replace(",", "")) for n in nums if n.replace(",", "").isdigit()]
+        if not nums:
+            return True
+
+        max_num = max(nums)
+
+        # If number looks like monthly stipend (< 1,00,000)
+        if max_num < 100000:
+            return max_num >= 8000
+
+        # If annual (> 1,00,000) — convert to monthly
+        monthly = max_num / 12
+        return monthly >= 8000
+
+    kept    = [j for j in jobs if is_acceptable_stipend(j.get("stipend", "Not disclosed"))]
+    removed = len(jobs) - len(kept)
+    print(f"Stipend filter: removed {removed} listings below Rs.8,000/mo, {len(kept)} kept.")
+    return kept
+
 # ═════════════════════════════════════════════
 # MAIN
 # ═════════════════════════════════════════════
@@ -1162,7 +1408,7 @@ def run():
         print(f"Skipping — today is {day_name}. Bot runs Mon / Thu / Sat / Sun only.")
         return
 
-    print("Starting Internship Bot v5.0...")
+    print("Starting Internship Bot v6.0...")
 
     # ── Step 1: Scrape all sources ──
     all_jobs = []
@@ -1172,7 +1418,9 @@ def run():
     all_jobs += scrape_naukri()
     all_jobs += scrape_foundit()
     all_jobs += scrape_jobaaj()
-    all_jobs += scrape_wellfound()        # NEW
+    all_jobs += scrape_wellfound()
+    all_jobs += scrape_iimjobs()           # NEW
+    all_jobs += scrape_company_careers()   # NEW
     all_jobs += get_quality_listings()
 
     # ── Step 2: Local dedup (same run) ──
@@ -1186,6 +1434,12 @@ def run():
 
     # ── Step 2b: Duration filter (max 4 months) ──
     unique_all = filter_by_duration(unique_all)
+
+    # ── Step 2c: Stipend filter (min Rs.8,000/mo) ──
+    unique_all = filter_by_stipend(unique_all)
+
+    # ── Step 2d: Company tier tagging ──
+    unique_all = apply_tier_tags(unique_all)
 
     # ── Step 3: Cross-run dedup via Google Sheets ──
     gs_client              = get_gsheet_client()
