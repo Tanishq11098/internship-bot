@@ -826,7 +826,117 @@ def build_excel(internships, filepath):
         ws_top.column_dimensions[get_column_letter(col)].width = w
     ws_top.freeze_panes = "A3"
 
-    # ── Sheet 3: Domain Summary ───────────────────────────────────────
+
+    # ── Sheet 3: 3-Month Internships ─────────────────────────────────
+    def is_3_month(d_str):
+        import re
+        d = d_str.lower().strip()
+        if any(x in d for x in ["not mentioned", "not disclosed", "n/a", "flexible"]):
+            return False
+        nums = list(map(int, re.findall(r"\d+", d)))
+        if not nums:
+            return False
+        if "month" in d:
+            return min(nums) <= 3 and max(nums) <= 3
+        if "week" in d:
+            return min(nums) <= 12 and max(nums) <= 12
+        return False
+
+    def is_4_month(d_str):
+        import re
+        d = d_str.lower().strip()
+        if any(x in d for x in ["not mentioned", "not disclosed", "n/a", "flexible"]):
+            return False
+        nums = list(map(int, re.findall(r"\d+", d)))
+        if not nums:
+            return False
+        if "month" in d:
+            return 4 in nums or max(nums) == 4
+        if "week" in d:
+            return min(nums) >= 13 and max(nums) <= 16
+        return False
+
+    for sheet_label, sheet_color, header_color, filter_fn, sheet_title in [
+        ("3-Month Internships", "FFF2CC", "BF8F00",
+         is_3_month, f"3-Month Internships — {today}"),
+        ("4-Month Internships", "DDEBF7", "1D6A96",
+         is_4_month, f"4-Month Internships — {today}"),
+    ]:
+        ws_dur = wb.create_sheet(sheet_label)
+        ws_dur.merge_cells("A1:P1")
+        ws_dur["A1"] = sheet_title
+        ws_dur["A1"].font = Font(name="Arial", bold=True, size=12, color=header_color)
+        ws_dur["A1"].fill = PatternFill("solid", start_color=sheet_color)
+        ws_dur["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        ws_dur.row_dimensions[1].height = 28
+
+        for col, h in enumerate(headers, 1):
+            cell = ws_dur.cell(2, col, h)
+            cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+            cell.fill = PatternFill("solid", start_color=header_color)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = thin
+        ws_dur.row_dimensions[2].height = 28
+
+        filtered = [j for j in internships_sorted if filter_fn(j.get("duration", ""))]
+
+        if not filtered:
+            ws_dur.merge_cells("A3:P3")
+            ws_dur["A3"] = "No listings found for this duration in today's run."
+            ws_dur["A3"].font = Font(name="Arial", italic=True, size=10, color="7F7F7F")
+            ws_dur["A3"].alignment = Alignment(horizontal="center", vertical="center")
+            ws_dur.row_dimensions[3].height = 30
+        else:
+            for i, job in enumerate(filtered, 1):
+                r      = i + 2
+                domain = job.get("domain", "Finance Operations")
+                color  = DOMAIN_COLORS.get(domain, "404040")
+                row_bg = "FFFEF0" if sheet_label == "3-Month Internships" else "F0F6FF"
+                row_bg = row_bg if i % 2 != 0 else "FFFFFF"
+                score  = job.get("fit_score", 5)
+                if score >= 9:   score_bg = "C6EFCE"; score_fc = "276221"
+                elif score >= 7: score_bg = "FFEB9C"; score_fc = "9C5700"
+                elif score >= 5: score_bg = "DDEBF7"; score_fc = "1F4E79"
+                else:            score_bg = "FFE0E0"; score_fc = "9C0006"
+
+                values = [i, job["title"], job["company"], job["firm_type"], job["domain"],
+                          job["location"], job["stipend"], job["duration"], job["posted"],
+                          job["deadline"], job["platform"], job["link"],
+                          job["status"], f"{score}/10", job.get("fit_reason", ""), ""]
+
+                for col, val in enumerate(values, 1):
+                    cell = ws_dur.cell(r, col, val)
+                    cell.border = thin
+                    cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                    if col == 2:
+                        cell.font = Font(name="Arial", size=9, bold=True, color=color)
+                        cell.fill = PatternFill("solid", start_color=row_bg)
+                    elif col == 12:
+                        cell.font = Font(name="Arial", size=9, color="1558BB", underline="single")
+                        cell.fill = PatternFill("solid", start_color=row_bg)
+                        cell.hyperlink = str(val)
+                    elif col == 13:
+                        cell.font = Font(name="Arial", size=9, bold=True, color="375623")
+                        cell.fill = PatternFill("solid", start_color="E2EFDA")
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                    elif col == 14:
+                        cell.font = Font(name="Arial", size=10, bold=True, color=score_fc)
+                        cell.fill = PatternFill("solid", start_color=score_bg)
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                    elif col == 15:
+                        cell.font = Font(name="Arial", size=8, italic=True, color="404040")
+                        cell.fill = PatternFill("solid", start_color=row_bg)
+                    else:
+                        cell.font = Font(name="Arial", size=9)
+                        cell.fill = PatternFill("solid", start_color=row_bg)
+                ws_dur.row_dimensions[r].height = 40
+
+        for col, w in enumerate(col_widths, 1):
+            ws_dur.column_dimensions[get_column_letter(col)].width = w
+        ws_dur.freeze_panes = "A3"
+        ws_dur.auto_filter.ref = f"A2:P{2 + max(len(filtered), 1)}"
+
+    # ── Sheet 5: Domain Summary ───────────────────────────────────────
     ws2 = wb.create_sheet("Domain Summary")
     ws2.merge_cells("A1:C1")
     ws2["A1"] = f"Internship Count by Domain — {today}"
@@ -865,7 +975,7 @@ def build_excel(internships, filepath):
     ws2.column_dimensions["B"].width = 10
     ws2.column_dimensions["C"].width = 40
 
-    # ── Sheet 4: Application Tracker ─────────────────────────────────
+    # ── Sheet 6: Application Tracker ─────────────────────────────────
     ws3 = wb.create_sheet("Application Tracker")
     ws3.merge_cells("A1:H1")
     ws3["A1"] = f"My Application Tracker — {today}"
@@ -1003,11 +1113,13 @@ DOMAIN BREAKDOWN:
 {domain_lines}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EXCEL HAS 4 SHEETS:
+EXCEL HAS 6 SHEETS:
   Sheet 1 — All Internships (sorted by AI Fit Score, color coded)
-  Sheet 2 — 🌟 Top Picks (Fit Score ≥ 7, ready to apply)
-  Sheet 3 — Domain Summary (count per domain + platforms)
-  Sheet 4 — Application Tracker (track your progress)
+  Sheet 2 — Top Picks (Fit Score 7+, best matches for you)
+  Sheet 3 — 3-Month Internships (short, focused internships)
+  Sheet 4 — 4-Month Internships (slightly longer internships)
+  Sheet 5 — Domain Summary (count per domain + platforms)
+  Sheet 6 — Application Tracker (track your progress)
 
 AI FIT SCORE is based on your resume:
   BBA Finance & Banking | SEBI NISM | McKinsey Forward
