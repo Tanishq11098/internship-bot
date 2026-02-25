@@ -947,6 +947,9 @@ def send_email(filepath, internships, new_count):
     msg["To"]      = SEND_TO_EMAIL
     msg["Subject"] = f"🎯 {new_count} NEW Internships for Tanishq — {today_str} — {total} Total"
 
+    no_picks_msg = "   No 9+ listings this run — check Sheet 1 for 7+ scores."
+    top_section  = top_lines if top_lines else no_picks_msg
+
     body = f"""Hi Tanishq,
 
 Your Internship Bot v5.0 report is ready!
@@ -960,7 +963,7 @@ SCHEDULE  : Runs every Monday, Thursday, Saturday & Sunday
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🌟 TOP PICKS FOR YOU (AI Score 9+/10)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{top_lines if top_lines else "   No 9+ listings this run — check Sheet 1 for 7+ scores.\n"}
+{top_section}
 
 SOURCES SCRAPED:
 {platform_lines}
