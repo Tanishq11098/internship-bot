@@ -1,4 +1,4 @@
-import smtplib, os, time, random, json
+import smtplib, os, time, random, json, re, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -9,14 +9,12 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import requests
 from bs4 import BeautifulSoup
-
-# ── Google Sheets (gspread) ──────────────────
 import gspread
 from google.oauth2.service_account import Credentials
-
-# ── Anthropic Claude API ─────────────────────
 import anthropic
 
+# ── Google Sheets (gspread) ──────────────────
+# ── Anthropic Claude API ─────────────────────
 # ─────────────────────────────────────────────
 # ENV / CONFIG
 # ─────────────────────────────────────────────
@@ -102,6 +100,57 @@ DOMAIN_COLORS = {
     "Operations / Growth":  "4A7C59",
 }
 
+###############################################################
+# 0.  UTILITY – text normalisation & resume keyword bank
+###############################################################
+
+RESUME_KEYWORDS = {
+    # keep all lowercase, single tokens only
+    "finance", "financial", "modeling", "modelling", "forecast",
+    "excel", "vlookup", "power", "pivot", "ratio", "analysis",
+    "consulting", "strategy", "mckinsey", "equity", "research",
+    "investment", "banking", "ib", "valuation", "dcf", "fp&a",
+}
+
+STOPWORDS = r"\b(pvt|ltd|limited|inc|llp|private|the|a|an|intern|internship)\b"
+
+def normalize(txt: str, limit: int = 40) -> str:
+    """Lower-case, drop stopwords, punctuation and collapse spaces."""
+    txt = txt.lower()
+    txt = re.sub(STOPWORDS, "", txt)
+    txt = re.sub(r"[^a-z0-9 ]", " ", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt[:limit]
+
+def keyword_match_percent(text: str) -> int:
+    """
+    Simple % overlap between resume keywords and the text supplied.
+    If description missing we evaluate on title + company only.
+    """
+    words = {w for w in re.split(r"\W+", text.lower()) if w}
+    if not words:
+        return 0
+    hits = len(RESUME_KEYWORDS & words)
+    return int(100 * hits / len(RESUME_KEYWORDS))
+
+###############################################################
+# 1.  JUNK listing filter
+###############################################################
+
+JUNK_KEYWORDS = {
+    "insurance agent", "loan agent", "direct selling", "mlm",
+    "commission only", "network marketing", "distributor",
+    "field sales", "door to door", "life insurance advisor",
+    "real estate agent", "telecaller", "bpo", "data entry",
+    "typing work", "work from home fraud"
+}
+
+def is_junk(job):
+    blob = (job["title"] + " " +
+            job["company"] + " " +
+            job.get("stipend", "")).lower()
+    return any(k in blob for k in JUNK_KEYWORDS)
+
 def get_headers():
     return random.choice(HEADERS_LIST)
 
@@ -173,8 +222,8 @@ def save_new_keys(ws, new_jobs):
     try:
         today_str = date.today().isoformat()
         rows = [
-            [j["title"].strip().lower()[:40],
-             j["company"].strip().lower()[:30],
+            [normalize(j["title"]),
+             normalize(j["company"]),
              j.get("domain", ""),
              today_str]
             for j in new_jobs
@@ -189,7 +238,7 @@ def filter_new_only(all_jobs, seen_keys):
     new_jobs, dup_count = [], 0
     local_seen = set()
     for j in all_jobs:
-        key = (j["title"].strip().lower()[:40], j["company"].strip().lower()[:30])
+        key = (normalize(j["title"]), normalize(j["company"]))
         if key in seen_keys or key in local_seen:
             dup_count += 1
         else:
@@ -213,19 +262,34 @@ def score_jobs_with_ai(jobs):
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-    # Build a compact job list for the prompt
+    # ---------- PASS-1: legitimacy check ----------
+    legitimacy_prompt = "Below are job titles. For each, reply JSON list of YES/NO if it is a genuine internship:\n" + \
+        json.dumps([j["title"] for j in jobs])
+    legit_resp = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=800,
+        messages=[{"role": "user", "content": legitimacy_prompt}]
+    )
+    legit_flags = json.loads(legit_resp.content[0].text.strip())
+    for flag, job in zip(legit_flags, jobs):
+        job["is_legit"] = str(flag).lower().startswith("y")
+    jobs = [j for j in jobs if j["is_legit"]]   # drop misleading "intern" FTE roles
+
+    # ---------- PASS-2: fit scoring ----------
     job_summaries = []
     for i, j in enumerate(jobs):
-        job_summaries.append(f"{i}: {j['title']} @ {j['company']} | Domain: {j['domain']} | Location: {j['location']} | Stipend: {j['stipend']}")
-    job_text = "\n".join(job_summaries)
+        snippet = j.get("description", "")[:250].replace("\n", " ")
+        job_summaries.append(
+            f"{i}: {j['title']} @ {j['company']} | {j['domain']} | {j['stipend']} | DESC: {snippet}"
+        )
 
     prompt = f"""You are a career advisor. Score each internship listing for fit with the candidate below.
 
 CANDIDATE RESUME:
 {RESUME_TEXT}
 
-INTERNSHIP LISTINGS (index: title @ company | domain | location | stipend):
-{job_text}
+INTERNSHIP LISTINGS (index: title @ company | domain | stipend | description):
+{job_summaries}
 
 For each listing, return a JSON array (same order, same indexes) like:
 [
@@ -261,12 +325,21 @@ Return ONLY the JSON array, no explanation, no markdown."""
             info = score_map.get(i, {})
             job["fit_score"]  = info.get("fit_score", 5)
             job["fit_reason"] = info.get("fit_reason", "Not scored")
+
+        # RULE-BASED keyword overlap (fast, no cost)
+        for job in jobs:
+            match_pct = keyword_match_percent(
+                (job.get("description") or "") + " " + job["title"]
+            )
+            job["kw_match_pct"] = match_pct
+
         print(f"AI fit scoring complete for {len(jobs)} listings.")
     except Exception as e:
         print(f"AI scoring error: {e}")
         for job in jobs:
             job.setdefault("fit_score", 5)
             job.setdefault("fit_reason", "Scoring unavailable")
+            job["kw_match_pct"] = 0
 
     return jobs
 
@@ -738,7 +811,6 @@ def get_quality_listings():
         {"title":"KPO Financial Analyst Intern","company":"Undisclosed KPO","firm_type":"KPO Finance","domain":"KPO Finance","location":"Noida, UP","stipend":"Rs.10,000-12,000/mo","duration":"3-6 Months","posted":"Active","deadline":"Rolling","status":"Not Applied","platform":"Naukri","link":"https://www.naukri.com/kpo-internship-jobs-in-noida"},
     ]
 
-
 # ═════════════════════════════════════════════
 # SOURCE 8: IIM JOBS
 # ═════════════════════════════════════════════
@@ -774,7 +846,7 @@ def scrape_iimjobs():
                 link    = job.select_one("a")
                 t = title.get_text(strip=True)   if title   else f"{fallback} Intern"
                 c = company.get_text(strip=True) if company else "N/A"
-                # IIMJobs direct link — job URLs contain /j/ 
+                # IIMJobs direct link — job URLs contain /j/
                 direct_link = url
                 job_link = (job.select_one("a[href*='/j/']") or
                             job.select_one("a.job-title") or
@@ -803,7 +875,6 @@ def scrape_iimjobs():
             print(f"IIMJobs error ({slug}): {e}")
     print(f"IIMJobs: {len(results)} results")
     return results
-
 
 # ═════════════════════════════════════════════
 # SOURCE 9: COMPANY CAREER PAGES (Direct)
@@ -895,7 +966,6 @@ def scrape_company_careers():
     print(f"Company Careers: {len(results)} results")
     return results
 
-
 # ═════════════════════════════════════════════
 # SOURCE 10: UNSTOP (formerly Dare2Compete)
 # ═════════════════════════════════════════════
@@ -971,7 +1041,6 @@ def scrape_unstop():
     print(f"Unstop: {len(results)} results")
     return results
 
-
 # ═════════════════════════════════════════════
 # LINKEDIN SEARCH URLs (direct filtered links)
 # ═════════════════════════════════════════════
@@ -1021,7 +1090,6 @@ def get_linkedin_urls():
         })
     print(f"LinkedIn URLs: {len(results)} search links generated")
     return results
-
 
 # ═════════════════════════════════════════════
 # SOURCE 11: ADZUNA API (free, reliable, India)
@@ -1119,14 +1187,14 @@ def scrape_adzuna():
                     "deadline":  "Not mentioned",
                     "status":    "Not Applied",
                     "platform":  "Adzuna",
-                    "link":      redirect
+                    "link":      redirect,
+                    "description": description[:300]  # NEW: store description
                 })
         except Exception as e:
             print(f"Adzuna error ({query}): {e}")
 
     print(f"Adzuna: {len(results)} results")
     return results
-
 
 # ═════════════════════════════════════════════
 # SOURCE 12: CUTSHORT (startup hiring platform)
@@ -1200,7 +1268,6 @@ def scrape_cutshort():
     print(f"Cutshort: {len(results)} results")
     return results
 
-
 # ═════════════════════════════════════════════
 # SOURCE 13: HIRECT (direct founder hiring)
 # ═════════════════════════════════════════════
@@ -1266,7 +1333,6 @@ def scrape_hirect():
             print(f"Hirect error ({keyword}): {e}")
     print(f"Hirect: {len(results)} results")
     return results
-
 
 # ═════════════════════════════════════════════
 # SOURCE 14: GOOGLE JOBS (aggregates 50+ sites)
@@ -1397,7 +1463,7 @@ def build_excel(internships, filepath):
     today = date.today().strftime("%B %d, %Y")
 
     # Title row
-    ws.merge_cells("A1:P1")
+    ws.merge_cells("A1:Q1")
     ws["A1"] = f"Finance & Management Internships — Delhi NCR | {today} | Sources: Internshala + Indeed + Glassdoor + Naukri + Foundit + Jobaaj + Wellfound"
     ws["A1"].font = Font(name="Arial", bold=True, size=12, color="1F4E79")
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
@@ -1405,7 +1471,7 @@ def build_excel(internships, filepath):
     ws.row_dimensions[1].height = 30
 
     # Legend row
-    ws.merge_cells("A2:P2")
+    ws.merge_cells("A2:Q2")
     ws["A2"] = ("Color legend — Red: IB | Orange: Equity/Valuation | Purple: PE/VC/HF | "
                 "Green: Wealth/AM/FP&A | Blue: Fintech/Credit/KPO | Brown: Audit/Compliance | "
                 "Crimson: Founder's Office | Gold: Mgmt Trainee | Steel Blue: Strategy | Sage: Ops/Growth  "
@@ -1417,7 +1483,7 @@ def build_excel(internships, filepath):
 
     headers = ["#", "Role / Internship Title", "Company", "Tier", "Firm Type", "Domain",
                "Location", "Stipend", "Duration", "Posted", "Deadline", "Platform",
-               "Apply Link", "Status", "AI Fit Score", "Why It Fits (AI)", "Notes"]
+               "Apply Link", "Status", "AI Fit Score", "KW Match %", "Days Since Posted", "Why It Fits (AI)", "Notes"]
     ws.append(headers)
     for col in range(1, len(headers) + 1):
         cell = ws.cell(row=3, column=col)
@@ -1443,10 +1509,18 @@ def build_excel(internships, filepath):
         elif score >= 5: score_bg = "DDEBF7"; score_fc = "1F4E79"   # blue
         else:            score_bg = "FFE0E0"; score_fc = "9C0006"   # red
 
+        # Days since posted
+        try:
+            days_old = (datetime.date.today() -
+                        datetime.datetime.strptime(job["posted"].split()[0], "%Y-%m-%d").date()).days
+        except Exception:
+            days_old = ""
+
         values = [i, job["title"], job["company"], job["firm_type"], job["domain"],
                   job["location"], job["stipend"], job["duration"], job["posted"],
                   job["deadline"], job["platform"], job["link"],
-                  job["status"], f"{score}/10", job.get("fit_reason", ""), ""]
+                  job["status"], f"{score}/10", f"{job.get('kw_match_pct',0)}%", days_old,
+                  job.get("fit_reason", ""), ""]
 
         for col, val in enumerate(values, 1):
             cell = ws.cell(r, col, val)
@@ -1471,7 +1545,18 @@ def build_excel(internships, filepath):
                 cell.font = Font(name="Arial", size=10, bold=True, color=score_fc)
                 cell.fill = PatternFill("solid", start_color=score_bg)
                 cell.alignment = Alignment(horizontal="center", vertical="center")
-            elif col == 15: # Why It Fits
+            elif col == 15: # KW Match %
+                cell.font = Font(name="Arial", size=9, bold=True, color="375623")
+                cell.fill = PatternFill("solid", start_color="E2EFDA")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif col == 16: # Days Since Posted
+                if days_old > 5:
+                    cell.font = Font(name="Arial", size=9, color="FF0000")
+                else:
+                    cell.font = Font(name="Arial", size=9, color="000000")
+                cell.fill = PatternFill("solid", start_color=row_bg)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif col == 17: # Why It Fits
                 cell.font = Font(name="Arial", size=8, italic=True, color="404040")
                 cell.fill = PatternFill("solid", start_color=row_bg)
             else:
@@ -1479,15 +1564,15 @@ def build_excel(internships, filepath):
                 cell.fill = PatternFill("solid", start_color=row_bg)
         ws.row_dimensions[r].height = 40
 
-    col_widths = [4, 38, 26, 10, 24, 24, 22, 20, 14, 12, 18, 14, 50, 16, 12, 38, 20]
+    col_widths = [4, 38, 26, 10, 24, 24, 22, 20, 14, 12, 18, 14, 50, 16, 12, 12, 12, 38, 20]
     for col, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = w
     ws.freeze_panes = "A4"
-    ws.auto_filter.ref = f"A3:P{3 + len(internships)}"
+    ws.auto_filter.ref = f"A3:Q{3 + len(internships)}"
 
     # ── Sheet 2: Top Picks (fit score >= 7) ──────────────────────────
     ws_top = wb.create_sheet("🌟 Top Picks")
-    ws_top.merge_cells("A1:P1")
+    ws_top.merge_cells("A1:Q1")
     ws_top["A1"] = f"Top Picks for Tanishq — AI Fit Score ≥ 7 — {today}"
     ws_top["A1"].font = Font(name="Arial", bold=True, size=12, color="276221")
     ws_top["A1"].fill = PatternFill("solid", start_color="C6EFCE")
@@ -1513,11 +1598,19 @@ def build_excel(internships, filepath):
         elif score >= 7: score_bg = "FFEB9C"; score_fc = "9C5700"
         else:            score_bg = "DDEBF7"; score_fc = "1F4E79"
 
-        values = [i, job["title"], job["company"], job["firm_type"], job["domain"],
-                  job["location"], job["stipend"], job["duration"], job["posted"],
-                  job["deadline"], job["platform"], job["link"],
-                  job["status"], f"{score}/10", job.get("fit_reason", ""), ""]
-        for col, val in enumerate(values, 1):
+        # Days since posted
+        try:
+            days_old = (datetime.date.today() -
+                        datetime.datetime.strptime(job["posted"].split()[0], "%Y-%m-%d").date()).days
+        except Exception:
+            days_old = ""
+
+        vals = [i, job["title"], job["company"], job["firm_type"], job["domain"],
+                job["location"], job["stipend"], job["duration"], job["posted"],
+                job["deadline"], job["platform"], job["link"],
+                job["status"], f"{score}/10", f"{job.get('kw_match_pct',0)}%", days_old,
+                job.get("fit_reason", ""), ""]
+        for col, val in enumerate(vals, 1):
             cell = ws_top.cell(r, col, val)
             cell.border = thin
             cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
@@ -1533,6 +1626,17 @@ def build_excel(internships, filepath):
                 cell.fill = PatternFill("solid", start_color=score_bg)
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             elif col == 15:
+                cell.font = Font(name="Arial", size=9, bold=True, color="375623")
+                cell.fill = PatternFill("solid", start_color="E2EFDA")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif col == 16:
+                if days_old > 5:
+                    cell.font = Font(name="Arial", size=9, color="FF0000")
+                else:
+                    cell.font = Font(name="Arial", size=9, color="000000")
+                cell.fill = PatternFill("solid", start_color=row_bg)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif col == 17:
                 cell.font = Font(name="Arial", size=8, italic=True, color="404040")
                 cell.fill = PatternFill("solid", start_color=row_bg)
             else:
@@ -1543,7 +1647,6 @@ def build_excel(internships, filepath):
     for col, w in enumerate(col_widths, 1):
         ws_top.column_dimensions[get_column_letter(col)].width = w
     ws_top.freeze_panes = "A3"
-
 
     # ── Sheet 3: 3-Month Internships ─────────────────────────────────
     def is_3_month(d_str):
@@ -1581,7 +1684,7 @@ def build_excel(internships, filepath):
          is_4_month, f"4-Month Internships — {today}"),
     ]:
         ws_dur = wb.create_sheet(sheet_label)
-        ws_dur.merge_cells("A1:P1")
+        ws_dur.merge_cells("A1:Q1")
         ws_dur["A1"] = sheet_title
         ws_dur["A1"].font = Font(name="Arial", bold=True, size=12, color=header_color)
         ws_dur["A1"].fill = PatternFill("solid", start_color=sheet_color)
@@ -1599,7 +1702,7 @@ def build_excel(internships, filepath):
         filtered = [j for j in internships_sorted if filter_fn(j.get("duration", ""))]
 
         if not filtered:
-            ws_dur.merge_cells("A3:P3")
+            ws_dur.merge_cells("A3:Q3")
             ws_dur["A3"] = "No listings found for this duration in today's run."
             ws_dur["A3"].font = Font(name="Arial", italic=True, size=10, color="7F7F7F")
             ws_dur["A3"].alignment = Alignment(horizontal="center", vertical="center")
@@ -1617,12 +1720,20 @@ def build_excel(internships, filepath):
                 elif score >= 5: score_bg = "DDEBF7"; score_fc = "1F4E79"
                 else:            score_bg = "FFE0E0"; score_fc = "9C0006"
 
-                values = [i, job["title"], job["company"], job["firm_type"], job["domain"],
-                          job["location"], job["stipend"], job["duration"], job["posted"],
-                          job["deadline"], job["platform"], job["link"],
-                          job["status"], f"{score}/10", job.get("fit_reason", ""), ""]
+                # Days since posted
+                try:
+                    days_old = (datetime.date.today() -
+                                datetime.datetime.strptime(job["posted"].split()[0], "%Y-%m-%d").date()).days
+                except Exception:
+                    days_old = ""
 
-                for col, val in enumerate(values, 1):
+                vals = [i, job["title"], job["company"], job["firm_type"], job["domain"],
+                        job["location"], job["stipend"], job["duration"], job["posted"],
+                        job["deadline"], job["platform"], job["link"],
+                        job["status"], f"{score}/10", f"{job.get('kw_match_pct',0)}%", days_old,
+                        job.get("fit_reason", ""), ""]
+
+                for col, val in enumerate(vals, 1):
                     cell = ws_dur.cell(r, col, val)
                     cell.border = thin
                     cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
@@ -1642,6 +1753,17 @@ def build_excel(internships, filepath):
                         cell.fill = PatternFill("solid", start_color=score_bg)
                         cell.alignment = Alignment(horizontal="center", vertical="center")
                     elif col == 15:
+                        cell.font = Font(name="Arial", size=9, bold=True, color="375623")
+                        cell.fill = PatternFill("solid", start_color="E2EFDA")
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                    elif col == 16:
+                        if days_old > 5:
+                            cell.font = Font(name="Arial", size=9, color="FF0000")
+                        else:
+                            cell.font = Font(name="Arial", size=9, color="000000")
+                        cell.fill = PatternFill("solid", start_color=row_bg)
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                    elif col == 17:
                         cell.font = Font(name="Arial", size=8, italic=True, color="404040")
                         cell.fill = PatternFill("solid", start_color=row_bg)
                     else:
@@ -1652,7 +1774,7 @@ def build_excel(internships, filepath):
         for col, w in enumerate(col_widths, 1):
             ws_dur.column_dimensions[get_column_letter(col)].width = w
         ws_dur.freeze_panes = "A3"
-        ws_dur.auto_filter.ref = f"A2:P{2 + max(len(filtered), 1)}"
+        ws_dur.auto_filter.ref = f"A2:Q{2 + max(len(filtered), 1)}"
 
     # ── Sheet 5: Domain Summary ───────────────────────────────────────
     ws2 = wb.create_sheet("Domain Summary")
@@ -1695,7 +1817,7 @@ def build_excel(internships, filepath):
 
     # ── Sheet 6: Application Tracker ─────────────────────────────────
     ws3 = wb.create_sheet("Application Tracker")
-    ws3.merge_cells("A1:H1")
+    ws3.merge_cells("A1:I1")
     ws3["A1"] = f"My Application Tracker — {today}"
     ws3["A1"].font = Font(name="Arial", bold=True, size=12, color="1F4E79")
     ws3["A1"].fill = PatternFill("solid", start_color="D6E4F0")
@@ -1717,7 +1839,7 @@ def build_excel(internships, filepath):
             cell.fill = PatternFill("solid", start_color=row_bg)
             cell.border = thin; cell.font = data_font
             if col == 1: cell.value = i - 2; cell.alignment = Alignment(horizontal="center")
-    ws3.merge_cells("A55:H55")
+    ws3.merge_cells("A55:I55")
     ws3["A55"] = "STATUS LEGEND"
     ws3["A55"].font = Font(name="Arial", bold=True, color="FFFFFF")
     ws3["A55"].fill = PatternFill("solid", start_color="1F4E79")
@@ -1727,7 +1849,7 @@ def build_excel(internships, filepath):
         cell.font = Font(name="Arial", bold=True, size=9)
         cell.fill = PatternFill("solid", start_color=color); cell.border = thin
         cell.alignment = Alignment(horizontal="center")
-        ws3.merge_cells(f"B{idx}:H{idx}")
+        ws3.merge_cells(f"B{idx}:I{idx}")
         ws3.cell(idx, 2).fill = PatternFill("solid", start_color=color)
         ws3.cell(idx, 2).border = thin
     for col, w in zip(range(1, 9), [4, 28, 36, 24, 16, 22, 18, 36]):
@@ -1796,7 +1918,6 @@ def build_excel(internships, filepath):
 
     wb.save(filepath)
     print(f"Excel saved: {filepath}")
-
 
 # ═════════════════════════════════════════════
 # DURATION FILTER — max 4 months
@@ -1918,321 +2039,4 @@ Good luck!
    Dedup: Google Sheets | AI Scoring: Claude API
    Schedule: Every day at 8:00 AM IST
 """
-    msg.attach(MIMEText(body, "plain"))
-    with open(filepath, "rb") as f:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(f.read())
-        encoders.encode_base64(part)
-        fname = os.path.basename(filepath)
-        part.add_header("Content-Disposition", f"attachment; filename={fname}")
-        msg.attach(part)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(YOUR_EMAIL, YOUR_PASSWORD)
-        server.sendmail(YOUR_EMAIL, SEND_TO_EMAIL, msg.as_string())
-    print("Email sent!")
-
-
-# ═════════════════════════════════════════════
-# COMPANY TIER TAGGING
-# ═════════════════════════════════════════════
-TIER1_COMPANIES = {
-    # Big 4 & Global Consulting
-    "pwc", "deloitte", "kpmg", "ey", "ernst", "mckinsey", "bcg", "bain",
-    "accenture", "oliver wyman", "roland berger",
-    # Global Banks & Finance
-    "goldman sachs", "morgan stanley", "jp morgan", "jpmorgan", "hsbc",
-    "barclays", "citibank", "citi", "deutsche bank", "ubs", "credit suisse",
-    "blackrock", "vanguard", "fidelity",
-    # Top Indian Finance
-    "kotak", "hdfc", "icici", "axis bank", "sbi", "sebi", "rbi",
-    "edelweiss", "motilal oswal", "iifl", "angel broking", "zerodha",
-    # Top Indian Startups (unicorns)
-    "cred", "zepto", "groww", "razorpay", "phonepe", "paytm", "meesho",
-    "swiggy", "zomato", "ola", "nykaa", "mamaearth", "boat",
-    "dream11", "games24x7", "mpl", "unacademy", "byju",
-    # PE / VC
-    "sequoia", "accel", "tiger global", "softbank", "general atlantic",
-    "warburg pincus", "carlyle", "blackstone", "kkr",
-}
-
-TIER2_COMPANIES = {
-    # Mid-tier consulting & finance
-    "wns", "genpact", "mphasis", "hexaware", "niit", "firstsource",
-    "ujjivan", "bandhan", "au small finance", "suryoday",
-    "avendus", "o3 capital", "veda corporate", "anand rathi",
-    "sharekhan", "5paisa", "upstox", "coin", "dhan",
-    # Mid startups
-    "travelclan", "cleartax", "zoho", "freshworks", "chargebee",
-    "postman", "browserstack", "darwinbox", "leadsquared",
-    "lendingkart", "capital float", "indifi", "yubi", "credavenue",
-}
-
-def tag_company_tier(company_name):
-    c = company_name.lower().strip()
-    if any(t in c for t in TIER1_COMPANIES):
-        return "Tier 1"
-    if any(t in c for t in TIER2_COMPANIES):
-        return "Tier 2"
-    return "Tier 3"
-
-def apply_tier_tags(jobs):
-    for job in jobs:
-        job["tier"] = tag_company_tier(job.get("company", ""))
-    tier_counts = {}
-    for job in jobs:
-        t = job["tier"]
-        tier_counts[t] = tier_counts.get(t, 0) + 1
-    print(f"Tier tagging: {tier_counts}")
-    return jobs
-
-
-# ═════════════════════════════════════════════
-# STIPEND FILTER — minimum Rs.8,000/month
-# ═════════════════════════════════════════════
-def filter_by_stipend(jobs):
-    """
-    Remove listings with stipend clearly below Rs.8,000/mo.
-    Keep if stipend is not disclosed (can't confirm it's low).
-    """
-    import re
-
-    def is_acceptable_stipend(stipend_str):
-        s = stipend_str.lower().strip()
-
-        # Keep if not disclosed — benefit of doubt
-        if any(x in s for x in ["not disclosed", "not mentioned", "as per",
-                                  "negotiable", "competitive", "as per norms",
-                                  "industry standard", "incentive"]):
-            return True
-
-        # Extract all numbers
-        nums = re.findall(r"[\d,]+", s)
-        nums = [int(n.replace(",", "")) for n in nums if n.replace(",", "").isdigit()]
-        if not nums:
-            return True
-
-        max_num = max(nums)
-
-        # If number looks like monthly stipend (< 1,00,000)
-        if max_num < 100000:
-            return max_num >= 8000
-
-        # If annual (> 1,00,000) — convert to monthly
-        monthly = max_num / 12
-        return monthly >= 8000
-
-    kept    = [j for j in jobs if is_acceptable_stipend(j.get("stipend", "Not disclosed"))]
-    removed = len(jobs) - len(kept)
-    print(f"Stipend filter: removed {removed} listings below Rs.8,000/mo, {len(kept)} kept.")
-    return kept
-
-
-# ═════════════════════════════════════════════
-# WEEKLY STRATEGIC REPORT (Sundays only)
-# ═════════════════════════════════════════════
-def send_weekly_report(internships, gs_client):
-    """
-    Every Sunday, send a strategic AI-generated report analyzing:
-    - Which domains have most opportunities
-    - Which platforms performed best
-    - Tier 1 company count
-    - Strategic recommendations for the coming week
-    """
-    today_weekday = date.today().weekday()
-    if today_weekday != 6:  # 6 = Sunday
-        return
-
-    print("Sunday detected — generating weekly strategic report...")
-    today_str = date.today().strftime("%B %d, %Y")
-
-    # ── Gather stats ──
-    domain_counts   = {}
-    platform_counts = {}
-    tier_counts     = {}
-    high_fit        = []
-
-    for job in internships:
-        d = job.get("domain", "Finance Operations")
-        p = job.get("platform", "Other")
-        t = job.get("tier", "Tier 3")
-        domain_counts[d]   = domain_counts.get(d, 0) + 1
-        platform_counts[p] = platform_counts.get(p, 0) + 1
-        tier_counts[t]     = tier_counts.get(t, 0) + 1
-        if job.get("fit_score", 0) >= 8:
-            high_fit.append(job)
-
-    top_domains   = sorted(domain_counts.items(),   key=lambda x: -x[1])[:5]
-    top_platforms = sorted(platform_counts.items(), key=lambda x: -x[1])[:5]
-    tier1_count   = tier_counts.get("Tier 1", 0)
-    tier2_count   = tier_counts.get("Tier 2", 0)
-
-    # ── Build stats text for Claude ──
-    stats_text = "Domain breakdown: " + ", ".join([d + ": " + str(c) for d, c in top_domains])
-    stats_text += ". Platform breakdown: " + ", ".join([p + ": " + str(c) for p, c in top_platforms])
-    stats_text += ". Tier 1 companies: " + str(tier1_count)
-    stats_text += ". High fit listings (8+): " + str(len(high_fit))
-    stats_text += ". Total listings this week: " + str(len(internships))
-
-    top_picks_text = ""
-    for j in sorted(high_fit, key=lambda x: -x.get("fit_score", 0))[:10]:
-        score   = j.get("fit_score", 0)
-        title   = j.get("title", "")
-        company = j.get("company", "")
-        domain  = j.get("domain", "")
-        tier    = j.get("tier", "")
-        top_picks_text += str(score) + "/10 — " + title + " @ " + company + " (" + domain + ", " + tier + ")\n"
-
-    # ── Ask Claude for strategic recommendations ──
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    prompt = """You are a career advisor for a college student urgently looking for internships.
-
-CANDIDATE: Tanishq Singhal
-- BBA Finance & Banking, 2nd year, IMS UCC Ghaziabad
-- SEBI NISM certified, McKinsey Forward Program, IIT Guwahati Winter Consulting Top 10%
-- Experience: Finance Intern at Yhills, Founder Fellow at 23 Ventures
-- Skills: Financial Modeling, Excel, Power BI, Strategy, Leadership
-- Goal: Land internship within 60 days
-- Best fit domains: Founder's Office, Strategy & Consulting, Investment Banking, Equity Research
-
-THIS WEEK'S INTERNSHIP DATA:
-""" + stats_text + """
-
-TOP LISTINGS THIS WEEK:
-""" + top_picks_text + """
-
-Write a concise weekly strategic report (plain text, no markdown) with:
-1. WEEK SUMMARY — key observations about this week's listings in 2-3 sentences
-2. TOP 3 DOMAINS TO FOCUS ON — which domains to prioritize this week and why
-3. BEST PLATFORM THIS WEEK — which platform gave best results and why
-4. ACTION PLAN — 5 specific actions Tanishq should take this coming week
-5. SKILL GAP ALERT — any skills repeatedly appearing in listings that Tanishq should highlight or develop
-
-Keep it practical, specific, and motivating. Max 400 words."""
-
-    try:
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        report_text = response.content[0].text.strip()
-    except Exception as e:
-        report_text = "AI report generation failed: " + str(e)
-        print(report_text)
-
-    # ── Send separate weekly report email ──
-    msg = MIMEMultipart()
-    msg["From"]    = YOUR_EMAIL
-    msg["To"]      = SEND_TO_EMAIL
-    msg["Subject"] = "📊 Weekly Internship Strategy Report — " + today_str
-
-    nl = "\n"
-    body = ("Hi Tanishq," + nl + nl +
-            "Your Weekly Strategic Internship Report is ready!" + nl + nl +
-            "=" * 50 + nl +
-            "WEEKLY STATS SNAPSHOT" + nl +
-            "=" * 50 + nl +
-            "Total listings this week : " + str(len(internships)) + nl +
-            "High fit listings (8+/10): " + str(len(high_fit)) + nl +
-            "Tier 1 companies         : " + str(tier1_count) + nl +
-            "Tier 2 companies         : " + str(tier2_count) + nl + nl +
-            "Top domains:" + nl +
-            nl.join(["  " + d + ": " + str(c) + " listings" for d, c in top_domains]) + nl + nl +
-            "Top platforms:" + nl +
-            nl.join(["  " + p + ": " + str(c) + " listings" for p, c in top_platforms]) + nl + nl +
-            "=" * 50 + nl +
-            "AI STRATEGIC REPORT" + nl +
-            "=" * 50 + nl +
-            report_text + nl + nl +
-            "=" * 50 + nl +
-            "TOP LISTINGS TO APPLY THIS WEEK" + nl +
-            "=" * 50 + nl +
-            top_picks_text + nl +
-            "-- Internship Bot v7.0 | Weekly Report every Sunday" + nl)
-
-    msg.attach(MIMEText(body, "plain"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(YOUR_EMAIL, YOUR_PASSWORD)
-        server.sendmail(YOUR_EMAIL, SEND_TO_EMAIL, msg.as_string())
-    print("Weekly strategic report sent!")
-
-# ═════════════════════════════════════════════
-# MAIN
-# ═════════════════════════════════════════════
-def run():
-    # Schedule guard
-    today_weekday = date.today().weekday()
-    if today_weekday not in RUN_ON_WEEKDAYS:
-        day_name = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][today_weekday]
-        print(f"Skipping — today is {day_name}. Bot runs every day.")
-        return
-
-    print("Starting Internship Bot v8.0...")
-
-    # ── Step 1: Scrape all sources ──
-    all_jobs = []
-    all_jobs += scrape_internshala()
-    all_jobs += scrape_indeed()
-    all_jobs += scrape_glassdoor()
-    all_jobs += scrape_naukri()
-    all_jobs += scrape_foundit()
-    all_jobs += scrape_jobaaj()
-    all_jobs += scrape_wellfound()
-    all_jobs += scrape_iimjobs()           # NEW
-    all_jobs += scrape_company_careers()
-    all_jobs += scrape_unstop()              # NEW
-    all_jobs += get_linkedin_urls()
-    all_jobs += scrape_adzuna()              # NEW — API based
-    all_jobs += scrape_cutshort()            # NEW — startups
-    all_jobs += scrape_hirect()              # NEW — founder hiring
-    all_jobs += scrape_google_jobs()         # NEW — aggregates 50+ sites
-    all_jobs += get_quality_listings()
-
-    # ── Step 2: Local dedup (same run) ──
-    seen_local, unique_all = set(), []
-    for j in all_jobs:
-        key = (j["title"].strip().lower()[:40], j["company"].strip().lower()[:30])
-        if key not in seen_local:
-            seen_local.add(key)
-            unique_all.append(j)
-    print(f"After local dedup: {len(unique_all)} unique listings")
-
-    # ── Step 2b: Duration filter (max 4 months) ──
-    unique_all = filter_by_duration(unique_all)
-
-    # ── Step 2c: Stipend filter (min Rs.8,000/mo) ──
-    unique_all = filter_by_stipend(unique_all)
-
-    # ── Step 2d: Company tier tagging ──
-    unique_all = apply_tier_tags(unique_all)
-
-    # ── Step 3: Cross-run dedup via Google Sheets ──
-    gs_client              = get_gsheet_client()
-    seen_keys, dedup_ws    = load_seen_keys(gs_client)
-    new_jobs               = filter_new_only(unique_all, seen_keys)
-    new_count              = len(new_jobs)
-
-    # Save new keys back to Google Sheets
-    save_new_keys(dedup_ws, new_jobs)
-
-    # For the Excel we show ALL unique (not just new) so context isn't lost,
-    # but email subject highlights new count
-    jobs_to_report = unique_all
-
-    # ── Step 4: AI Fit Scoring ──
-    print("Running AI fit scoring...")
-    jobs_to_report = score_jobs_with_ai(jobs_to_report)
-
-    # ── Step 5: Build Excel & Send Email ──
-    today_str = date.today().strftime("%Y-%m-%d")
-    filepath  = f"/tmp/Internships_Tanishq_{today_str}.xlsx"
-    build_excel(jobs_to_report, filepath)
-    send_email(filepath, jobs_to_report, new_count)
-
-    # ── Step 6: Weekly strategic report (Sundays only) ──
-    send_weekly_report(jobs_to_report, gs_client)
-
-    print(f"Done! {len(jobs_to_report)} total listings, {new_count} new this run.")
-
-if __name__ == "__main__":
-    run()
+  
