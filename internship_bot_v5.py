@@ -31,6 +31,10 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 GSHEET_ID     = os.environ["GSHEET_ID"]
 GSHEET_TAB    = "seen_listings"   # tab name for deduplication log
 
+# Adzuna API credentials
+ADZUNA_APP_ID  = os.environ.get("ADZUNA_APP_ID",  "d69dc243")
+ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "d0727414dbf421e1c5b42f97019bb50d")
+
 # ─────────────────────────────────────────────
 # SCHEDULE: Mon, Thu, Sat, Sun
 # ─────────────────────────────────────────────
@@ -1018,6 +1022,362 @@ def get_linkedin_urls():
     print(f"LinkedIn URLs: {len(results)} search links generated")
     return results
 
+
+# ═════════════════════════════════════════════
+# SOURCE 11: ADZUNA API (free, reliable, India)
+# ═════════════════════════════════════════════
+def scrape_adzuna():
+    """
+    Adzuna Jobs API — free tier, 100 calls/day.
+    Returns real job listings aggregated from 50+ sources.
+    Much more reliable than scraping as it uses official API.
+    """
+    results = []
+    app_id  = os.environ.get("ADZUNA_APP_ID",  "d69dc243")
+    app_key = os.environ.get("ADZUNA_APP_KEY", "d0727414dbf421e1c5b42f97019bb50d")
+
+    searches = [
+        ("finance intern",              "Finance Operations"),
+        ("investment banking intern",   "Investment Banking"),
+        ("equity research intern",      "Equity Research"),
+        ("strategy intern",             "Strategy & Consulting"),
+        ("consulting intern",           "Strategy & Consulting"),
+        ("founder office intern",       "Founder's Office"),
+        ("management trainee",          "Management Trainee"),
+        ("operations intern",           "Operations / Growth"),
+        ("fintech intern",              "Fintech / Payments"),
+        ("private equity intern",       "Private Equity"),
+        ("venture capital intern",      "Venture Capital"),
+        ("audit intern",                "Audit / Assurance"),
+        ("valuation intern",            "Valuation"),
+        ("credit analyst intern",       "Credit / Debt"),
+        ("wealth management intern",    "Wealth Management"),
+        ("financial analyst intern",    "Finance Operations"),
+        ("growth intern",               "Operations / Growth"),
+        ("chief of staff intern",       "Founder's Office"),
+    ]
+
+    for query, fallback in searches:
+        try:
+            time.sleep(random.uniform(1, 1.5))
+            url = "https://api.adzuna.com/v1/api/jobs/in/search/1"
+            params = {
+                "app_id":         app_id,
+                "app_key":        app_key,
+                "results_per_page": 10,
+                "what":           query,
+                "where":          "Delhi",
+                "distance":       50,        # 50km radius
+                "max_days_old":   7,
+                "content-type":   "application/json",
+                "sort_by":        "date",
+            }
+            r    = requests.get(url, params=params, timeout=15)
+            data = r.json()
+            jobs = data.get("results", [])
+
+            for job in jobs:
+                title       = job.get("title", f"{fallback} Intern")
+                company     = job.get("company", {}).get("display_name", "N/A")
+                location    = job.get("location", {}).get("display_name", "Delhi NCR")
+                description = job.get("description", "")
+                redirect    = job.get("redirect_url", "")
+                salary_min  = job.get("salary_min", 0)
+                salary_max  = job.get("salary_max", 0)
+                created     = job.get("created", "")[:10] if job.get("created") else "Recent"
+
+                # Build stipend string from salary data
+                if salary_min and salary_max:
+                    # Adzuna returns annual — convert to monthly
+                    mo_min = int(salary_min / 12)
+                    mo_max = int(salary_max / 12)
+                    stipend = "Rs." + str(mo_min) + "-" + str(mo_max) + "/mo"
+                elif salary_min:
+                    mo = int(salary_min / 12)
+                    stipend = "Rs." + str(mo) + "/mo"
+                else:
+                    stipend = "Not disclosed"
+
+                # Skip if clearly not an internship
+                combined = (title + " " + description).lower()
+                if not any(x in combined for x in [
+                    "intern", "trainee", "fresher", "graduate", "entry",
+                    "junior", "associate", "analyst"
+                ]):
+                    continue
+
+                d = detect_domain(title, company)
+                results.append({
+                    "title":     title,
+                    "company":   company,
+                    "firm_type": "Corporate / MNC",
+                    "domain":    d if d != "Finance Operations" else fallback,
+                    "location":  location,
+                    "stipend":   stipend,
+                    "duration":  "Not mentioned",
+                    "posted":    created,
+                    "deadline":  "Not mentioned",
+                    "status":    "Not Applied",
+                    "platform":  "Adzuna",
+                    "link":      redirect
+                })
+        except Exception as e:
+            print(f"Adzuna error ({query}): {e}")
+
+    print(f"Adzuna: {len(results)} results")
+    return results
+
+
+# ═════════════════════════════════════════════
+# SOURCE 12: CUTSHORT (startup hiring platform)
+# ═════════════════════════════════════════════
+def scrape_cutshort():
+    """
+    Cutshort is heavily used by Indian startups for hiring.
+    Great source for Founder's Office, Strategy, and Growth roles
+    that don't appear on traditional job boards.
+    """
+    results = []
+    searches = [
+        ("finance", "Finance Operations"),
+        ("investment-banking", "Investment Banking"),
+        ("strategy", "Strategy & Consulting"),
+        ("founder-office", "Founder's Office"),
+        ("operations", "Operations / Growth"),
+        ("growth", "Operations / Growth"),
+        ("fintech", "Fintech / Payments"),
+        ("equity-research", "Equity Research"),
+        ("consulting", "Strategy & Consulting"),
+        ("management-trainee", "Management Trainee"),
+    ]
+    for keyword, fallback in searches:
+        try:
+            time.sleep(random.uniform(2, 3))
+            url = f"https://cutshort.io/jobs?type=internship&q={keyword}&location=Delhi"
+            r   = requests.get(url, headers=get_headers(), timeout=20)
+            soup = BeautifulSoup(r.text, "html.parser")
+            jobs = (soup.select(".job-card") or
+                    soup.select("[class*='JobCard']") or
+                    soup.select("[class*='job-listing']") or
+                    soup.select("div[data-cy='job-card']"))
+            for job in jobs[:8]:
+                title   = (job.select_one("[class*='title']") or
+                           job.select_one("h2") or job.select_one("h3"))
+                company = (job.select_one("[class*='company']") or
+                           job.select_one("[class*='org']") or
+                           job.select_one("h4"))
+                loc     = job.select_one("[class*='location']")
+                stipend = (job.select_one("[class*='salary']") or
+                           job.select_one("[class*='stipend']"))
+
+                # Direct link
+                direct_link = url
+                job_link = (job.select_one("a[href*='/jobs/']") or
+                            job.select_one("a[href*='/internship/']") or
+                            job.select_one("a"))
+                if job_link and job_link.get("href"):
+                    h = job_link["href"]
+                    direct_link = h if h.startswith("http") else "https://cutshort.io" + h
+
+                t = title.get_text(strip=True)   if title   else f"{fallback} Intern"
+                c = company.get_text(strip=True) if company else "N/A"
+                d = detect_domain(t, c)
+                results.append({
+                    "title":     t, "company": c,
+                    "firm_type": "Startup",
+                    "domain":    d if d != "Finance Operations" else fallback,
+                    "location":  loc.get_text(strip=True)     if loc     else "Delhi NCR",
+                    "stipend":   stipend.get_text(strip=True) if stipend else "Not disclosed",
+                    "duration":  "Not mentioned",
+                    "posted":    "< 7 days",
+                    "deadline":  "Not mentioned",
+                    "status":    "Not Applied",
+                    "platform":  "Cutshort",
+                    "link":      direct_link
+                })
+        except Exception as e:
+            print(f"Cutshort error ({keyword}): {e}")
+    print(f"Cutshort: {len(results)} results")
+    return results
+
+
+# ═════════════════════════════════════════════
+# SOURCE 13: HIRECT (direct founder hiring)
+# ═════════════════════════════════════════════
+def scrape_hirect():
+    """
+    Hirect connects candidates directly with founders/CEOs.
+    Best source for Founder's Office and early-stage startup roles.
+    """
+    results = []
+    searches = [
+        ("finance-intern", "Finance Operations"),
+        ("strategy-intern", "Strategy & Consulting"),
+        ("founder-office", "Founder's Office"),
+        ("operations-intern", "Operations / Growth"),
+        ("business-development", "Operations / Growth"),
+        ("management-trainee", "Management Trainee"),
+        ("fintech-intern", "Fintech / Payments"),
+        ("growth-intern", "Operations / Growth"),
+    ]
+    for keyword, fallback in searches:
+        try:
+            time.sleep(random.uniform(2, 3))
+            url = f"https://hirect.in/job-search/{keyword}?city=Delhi"
+            r   = requests.get(url, headers=get_headers(), timeout=20)
+            soup = BeautifulSoup(r.text, "html.parser")
+            jobs = (soup.select(".job-card") or
+                    soup.select("[class*='JobCard']") or
+                    soup.select("[class*='card']") or
+                    soup.select("div[class*='job']"))
+            for job in jobs[:8]:
+                title   = (job.select_one("[class*='title']") or
+                           job.select_one("h2") or job.select_one("h3"))
+                company = (job.select_one("[class*='company']") or
+                           job.select_one("h4"))
+                loc     = job.select_one("[class*='location']")
+                stipend = job.select_one("[class*='salary']")
+
+                direct_link = url
+                job_link = (job.select_one("a[href*='/job/']") or
+                            job.select_one("a[href*='/jobs/']") or
+                            job.select_one("a"))
+                if job_link and job_link.get("href"):
+                    h = job_link["href"]
+                    direct_link = h if h.startswith("http") else "https://hirect.in" + h
+
+                t = title.get_text(strip=True)   if title   else f"{fallback} Intern"
+                c = company.get_text(strip=True) if company else "N/A"
+                d = detect_domain(t, c)
+                results.append({
+                    "title":     t, "company": c,
+                    "firm_type": "Startup (Direct Founder)",
+                    "domain":    d if d != "Finance Operations" else fallback,
+                    "location":  loc.get_text(strip=True)     if loc     else "Delhi NCR",
+                    "stipend":   stipend.get_text(strip=True) if stipend else "Not disclosed",
+                    "duration":  "Not mentioned",
+                    "posted":    "< 7 days",
+                    "deadline":  "Not mentioned",
+                    "status":    "Not Applied",
+                    "platform":  "Hirect",
+                    "link":      direct_link
+                })
+        except Exception as e:
+            print(f"Hirect error ({keyword}): {e}")
+    print(f"Hirect: {len(results)} results")
+    return results
+
+
+# ═════════════════════════════════════════════
+# SOURCE 14: GOOGLE JOBS (aggregates 50+ sites)
+# ═════════════════════════════════════════════
+def scrape_google_jobs():
+    """
+    Google Jobs aggregates listings from ALL major job boards.
+    One search = results from Naukri, Indeed, Internshala, etc.
+    Uses Google's htl jobs endpoint which returns structured data.
+    """
+    results = []
+    searches = [
+        ("finance internship Delhi NCR",           "Finance Operations"),
+        ("investment banking internship Delhi",     "Investment Banking"),
+        ("equity research internship Delhi",        "Equity Research"),
+        ("founder office internship Delhi",         "Founder's Office"),
+        ("strategy consulting internship Delhi",    "Strategy & Consulting"),
+        ("management trainee finance Delhi",        "Management Trainee"),
+        ("operations growth internship Delhi",      "Operations / Growth"),
+        ("private equity internship Delhi",         "Private Equity"),
+        ("fintech internship Delhi NCR",            "Fintech / Payments"),
+        ("venture capital internship Delhi",        "Venture Capital"),
+        ("valuation analyst internship Delhi",      "Valuation"),
+        ("audit internship Delhi NCR",              "Audit / Assurance"),
+        ("credit analyst internship Delhi",         "Credit / Debt"),
+        ("wealth management internship Delhi",      "Wealth Management"),
+        ("chief of staff internship Delhi startup", "Founder's Office"),
+    ]
+
+    # Google Jobs uses a special header for structured job results
+    google_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    for query, fallback in searches:
+        try:
+            time.sleep(random.uniform(3, 5))  # Google needs longer delays
+            encoded = requests.utils.quote(query)
+            url = f"https://www.google.com/search?q={encoded}&ibp=htl;jobs&hl=en-IN&gl=in"
+            r   = requests.get(url, headers=google_headers, timeout=20)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Google Jobs structured data selectors
+            jobs = (soup.select("[data-ved][class*='iFjolb']") or
+                    soup.select(".PwjeAc") or
+                    soup.select("[jscontroller*='job']") or
+                    soup.select(".g") or
+                    soup.select("[class*='job']"))
+
+            for job in jobs[:6]:
+                title   = (job.select_one("[class*='BjJfJf']") or
+                           job.select_one("[class*='title']") or
+                           job.select_one("h3") or job.select_one("h2"))
+                company = (job.select_one("[class*='vNEEBe']") or
+                           job.select_one("[class*='company']") or
+                           job.select_one("[class*='subtitle']"))
+                loc     = (job.select_one("[class*='Qk80Jf']") or
+                           job.select_one("[class*='location']"))
+                link    = job.select_one("a[href]")
+
+                t = title.get_text(strip=True)   if title   else f"{fallback} Intern"
+                c = company.get_text(strip=True) if company else "N/A"
+
+                # Skip generic/irrelevant results
+                if len(t) < 5 or len(t) > 150:
+                    continue
+                if not any(x in t.lower() for x in [
+                    "intern", "trainee", "analyst", "associate",
+                    "finance", "strategy", "founder", "officer"
+                ]):
+                    continue
+
+                # Build direct link
+                direct_link = ""
+                if link and link.get("href"):
+                    h = link["href"]
+                    if h.startswith("/url?q="):
+                        # Google redirect — extract actual URL
+                        import urllib.parse
+                        parsed = urllib.parse.parse_qs(urllib.parse.urlparse(h).query)
+                        direct_link = parsed.get("q", [h])[0]
+                    elif h.startswith("http"):
+                        direct_link = h
+                    else:
+                        direct_link = "https://www.google.com" + h
+
+                if not direct_link:
+                    direct_link = "https://www.google.com/search?q=" + requests.utils.quote(t + " " + c + " internship apply")
+
+                d = detect_domain(t, c)
+                results.append({
+                    "title":     t, "company": c,
+                    "firm_type": "Various (Google Jobs)",
+                    "domain":    d if d != "Finance Operations" else fallback,
+                    "location":  loc.get_text(strip=True) if loc else "Delhi NCR",
+                    "stipend":   "Not disclosed",
+                    "duration":  "Not mentioned",
+                    "posted":    "< 7 days",
+                    "deadline":  "Not mentioned",
+                    "status":    "Not Applied",
+                    "platform":  "Google Jobs",
+                    "link":      direct_link
+                })
+        except Exception as e:
+            print(f"Google Jobs error ({query}): {e}")
+
+    print(f"Google Jobs: {len(results)} results")
+    return results
+
 # ═════════════════════════════════════════════
 # BUILD EXCEL  (now with Fit Score column)
 # ═════════════════════════════════════════════
@@ -1511,13 +1871,14 @@ def send_email(filepath, internships, new_count):
 
     body = f"""Hi Tanishq,
 
-Your Internship Bot v7.0 report is ready!
+Your Internship Bot v8.0 report is ready!
 
 DATE      : {today_str}
 NEW TODAY : {new_count} listings (not seen before)
 TOTAL     : {total} internships (including recurring)
 LOCATION  : Delhi / Gurugram / Noida / Greater Noida
 SCHEDULE  : Runs every day at 8:00 AM IST
+SOURCES   : 14 platforms + Adzuna API (100+ daily)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🌟 TOP PICKS FOR YOU (AI Score 9+/10)
@@ -1552,8 +1913,8 @@ HOW TO USE:
   4. Use Sheet 4 to track interview progress
 
 Good luck!
--- Internship Bot v7.0 (GitHub Actions)
-   Sources: Internshala + Indeed + Glassdoor + Naukri + Foundit + Jobaaj + Wellfound + IIMJobs + Company Careers + Unstop + LinkedIn URLs
+-- Internship Bot v8.0 (GitHub Actions)
+   Sources: Internshala + Indeed + Glassdoor + Naukri + Foundit + Jobaaj + Wellfound + IIMJobs + Company Careers + Unstop + LinkedIn URLs + Adzuna API + Cutshort + Hirect + Google Jobs
    Dedup: Google Sheets | AI Scoring: Claude API
    Schedule: Every day at 8:00 AM IST
 """
@@ -1806,7 +2167,7 @@ def run():
         print(f"Skipping — today is {day_name}. Bot runs every day.")
         return
 
-    print("Starting Internship Bot v6.0...")
+    print("Starting Internship Bot v8.0...")
 
     # ── Step 1: Scrape all sources ──
     all_jobs = []
@@ -1820,7 +2181,11 @@ def run():
     all_jobs += scrape_iimjobs()           # NEW
     all_jobs += scrape_company_careers()
     all_jobs += scrape_unstop()              # NEW
-    all_jobs += get_linkedin_urls()          # NEW
+    all_jobs += get_linkedin_urls()
+    all_jobs += scrape_adzuna()              # NEW — API based
+    all_jobs += scrape_cutshort()            # NEW — startups
+    all_jobs += scrape_hirect()              # NEW — founder hiring
+    all_jobs += scrape_google_jobs()         # NEW — aggregates 50+ sites
     all_jobs += get_quality_listings()
 
     # ── Step 2: Local dedup (same run) ──
