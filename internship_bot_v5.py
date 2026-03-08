@@ -20,19 +20,7 @@ EMAIL = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 TO_EMAIL = os.environ.get("EMAIL_TO")
 
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
-
 OUTPUT_FILE = "internships.xlsx"
-
-KEYWORDS = [
-    "finance intern",
-    "investment banking intern",
-    "equity research intern",
-    "consulting intern",
-    "strategy intern",
-]
-
-LOCATIONS = ["India", "Mumbai", "Delhi", "Bangalore"]
 
 # -------------------------------------------------
 # TIER 1 COMPANIES
@@ -42,7 +30,6 @@ TIER1 = [
     "goldman sachs",
     "morgan stanley",
     "jpmorgan",
-    "jp morgan",
     "hsbc",
     "barclays",
     "citibank",
@@ -57,11 +44,20 @@ TIER1 = [
 ]
 
 # -------------------------------------------------
+# BLOCKED LINKS (SPECIFIC OLD INTERNSHIPS)
+# -------------------------------------------------
+
+EXCLUDED_LINKS = {
+    "https://www.jobaaj.com/job/barclays-corporate-finance-intern-delhi-ncr-0-to-1-years-760847",
+    "https://www.jobaaj.com/job/hsbc-investment-banking-intern-delhi-ncr-0-to-1-years-670612"
+}
+
+# -------------------------------------------------
 # PROXY ROTATION
 # -------------------------------------------------
 
 PROXIES = [
-    None,
+    None
 ]
 
 def get_proxy():
@@ -89,7 +85,7 @@ def safe_request(url, headers=None):
             if r.status_code == 200:
                 return r
 
-        except Exception:
+        except:
             pass
 
         time.sleep(30)
@@ -97,51 +93,7 @@ def safe_request(url, headers=None):
     return None
 
 # -------------------------------------------------
-# LINKEDIN API
-# -------------------------------------------------
-
-def scrape_linkedin():
-
-    jobs = []
-
-    url = "https://linkedin-jobs-search.p.rapidapi.com/"
-
-    headers = {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "linkedin-jobs-search.p.rapidapi.com"
-    }
-
-    for kw in KEYWORDS:
-
-        params = {
-            "keywords": kw,
-            "location": "India",
-            "datePosted": "past24Hours"
-        }
-
-        try:
-
-            r = requests.get(url, headers=headers, params=params)
-            data = r.json()
-
-            for j in data:
-
-                jobs.append({
-                    "title": j.get("title"),
-                    "company": j.get("company"),
-                    "location": j.get("location"),
-                    "link": j.get("url"),
-                    "source": "LinkedIn",
-                    "deadline": ""
-                })
-
-        except:
-            pass
-
-    return jobs
-
-# -------------------------------------------------
-# SHINE
+# SHINE SCRAPER
 # -------------------------------------------------
 
 def scrape_shine():
@@ -173,7 +125,8 @@ def scrape_shine():
                 "location": "India",
                 "link": link,
                 "source": "Shine",
-                "deadline": ""
+                "deadline": "",
+                "posted_date": TODAY
             })
 
         except:
@@ -182,14 +135,14 @@ def scrape_shine():
     return jobs
 
 # -------------------------------------------------
-# TIMESJOBS
+# TIMESJOBS SCRAPER
 # -------------------------------------------------
 
 def scrape_timesjobs():
 
     jobs = []
 
-    url = "https://www.timesjobs.com/candidate/job-search.html?searchType=personalizedSearch&txtKeywords=finance+intern"
+    url = "https://www.timesjobs.com/candidate/job-search.html?txtKeywords=finance+intern"
 
     r = safe_request(url)
 
@@ -214,7 +167,8 @@ def scrape_timesjobs():
                 "location": "India",
                 "link": link,
                 "source": "TimesJobs",
-                "deadline": ""
+                "deadline": "",
+                "posted_date": TODAY
             })
 
         except:
@@ -223,93 +177,48 @@ def scrape_timesjobs():
     return jobs
 
 # -------------------------------------------------
-# APNA
+# FILTER: REMOVE EXCLUDED LINKS
 # -------------------------------------------------
 
-def scrape_apna():
+def remove_excluded_jobs(jobs):
 
-    jobs = []
+    filtered = []
 
-    url = "https://apna.co/jobs?query=intern"
+    for j in jobs:
 
-    r = safe_request(url)
+        link = j.get("link", "").strip()
 
-    if not r:
-        return jobs
+        if link in EXCLUDED_LINKS:
+            continue
 
-    soup = BeautifulSoup(r.text, "html.parser")
+        filtered.append(j)
 
-    cards = soup.select(".JobCard")
-
-    for c in cards:
-
-        try:
-
-            title = c.select_one(".JobCard_jobTitle").text.strip()
-            company = c.select_one(".JobCard_companyName").text.strip()
-
-            link = "https://apna.co"
-
-            jobs.append({
-                "title": title,
-                "company": company,
-                "location": "India",
-                "link": link,
-                "source": "Apna",
-                "deadline": ""
-            })
-
-        except:
-            pass
-
-    return jobs
+    return filtered
 
 # -------------------------------------------------
-# IIM BOARDS
+# FILTER: REMOVE OLD JOBAAJ INTERNSHIPS (>6 MONTHS)
 # -------------------------------------------------
 
-def scrape_iim():
+def remove_old_jobaaj(jobs):
 
-    jobs = []
+    filtered = []
 
-    boards = [
-        "https://www.iima.ac.in",
-        "https://www.iimb.ac.in",
-        "https://www.iimcal.ac.in"
-    ]
+    cutoff = TODAY - timedelta(days=180)
 
-    for b in boards:
+    for j in jobs:
 
-        try:
+        link = j.get("link", "")
 
-            r = safe_request(b)
+        if "jobaaj.com" in link:
 
-            if not r:
+            posted = j.get("posted_date")
+
+            if posted and posted < cutoff:
                 continue
 
-            soup = BeautifulSoup(r.text, "html.parser")
+        filtered.append(j)
 
-            links = soup.find_all("a")
-
-            for l in links:
-
-                txt = l.text.lower()
-
-                if "intern" in txt:
-
-                    jobs.append({
-                        "title": l.text.strip(),
-                        "company": "Various",
-                        "location": "India",
-                        "link": l.get("href"),
-                        "source": "IIM Board",
-                        "deadline": ""
-                    })
-
-        except:
-            pass
-
-    return jobs
+    return filtered
 
 # -------------------------------------------------
 # DOMAIN CLASSIFIER
@@ -341,22 +250,6 @@ def is_tier1(company):
     return any(t in c for t in TIER1)
 
 # -------------------------------------------------
-# DEADLINE COUNTDOWN
-# -------------------------------------------------
-
-def days_left(deadline):
-
-    try:
-
-        d = datetime.strptime(deadline, "%Y-%m-%d")
-
-        return (d - TODAY).days
-
-    except:
-
-        return ""
-
-# -------------------------------------------------
 # EMAIL DIGEST
 # -------------------------------------------------
 
@@ -365,7 +258,6 @@ def send_email(jobs):
     grouped = defaultdict(list)
 
     for j in jobs:
-
         grouped[j["domain"]].append(j)
 
     html = "<h2>Internship Digest</h2>"
@@ -395,47 +287,8 @@ def send_email(jobs):
     msg.attach(MIMEText(html, "html"))
 
     server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-
     server.login(EMAIL, EMAIL_PASS)
-
     server.sendmail(EMAIL, TO_EMAIL, msg.as_string())
-
-    server.quit()
-
-# -------------------------------------------------
-# TIER1 ALERT
-# -------------------------------------------------
-
-def send_tier1_alert(jobs):
-
-    if not jobs:
-        return
-
-    html = "<h2>🚨 TIER 1 INTERNSHIP ALERT</h2>"
-
-    for j in jobs:
-
-        html += f"""
-        <p>
-        <b>{j['company']}</b> – {j['title']}<br>
-        <a href="{j['link']}">APPLY NOW</a>
-        </p>
-        """
-
-    msg = MIMEMultipart("alternative")
-
-    msg["Subject"] = "🚨 Tier1 Internship Alert"
-    msg["From"] = EMAIL
-    msg["To"] = TO_EMAIL
-
-    msg.attach(MIMEText(html, "html"))
-
-    server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-
-    server.login(EMAIL, EMAIL_PASS)
-
-    server.sendmail(EMAIL, TO_EMAIL, msg.as_string())
-
     server.quit()
 
 # -------------------------------------------------
@@ -446,39 +299,32 @@ def main():
 
     jobs = []
 
-    jobs += scrape_linkedin()
     jobs += scrape_shine()
     jobs += scrape_timesjobs()
-    jobs += scrape_apna()
-    jobs += scrape_iim()
 
     print("Jobs scraped:", len(jobs))
+
+    # Remove specific old internships
+    jobs = remove_excluded_jobs(jobs)
+
+    # Remove old jobaaj listings
+    jobs = remove_old_jobaaj(jobs)
 
     for j in jobs:
 
         j["domain"] = classify_domain(j["title"])
-
         j["tier1"] = is_tier1(j["company"])
-
-        j["days_left"] = days_left(j["deadline"])
 
     df = pd.DataFrame(jobs)
 
     tier1_df = df[df["tier1"] == True]
 
-    new_df = df
-
     with pd.ExcelWriter(OUTPUT_FILE) as writer:
 
         df.to_excel(writer, sheet_name="All Listings", index=False)
-
         tier1_df.to_excel(writer, sheet_name="Tier1 Only", index=False)
 
-        new_df.to_excel(writer, sheet_name="New Since Yesterday", index=False)
-
     send_email(jobs)
-
-    send_tier1_alert(tier1_df.to_dict("records"))
 
 if __name__ == "__main__":
     main()
