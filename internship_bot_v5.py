@@ -1485,7 +1485,131 @@ def build_excel(internships, filepath):
     ws.freeze_panes = "A4"
     ws.auto_filter.ref = f"A3:P{3 + len(internships)}"
 
-    # ── Sheet 2: Top Picks (fit score >= 7) ──────────────────────────
+    # ── Sheet 2: Posted Today ─────────────────────────────────────────
+    # Only internships with a posted date that is TODAY (same calendar date as run date).
+    # Accepts: today's ISO date (YYYY-MM-DD), "Today", "today", "Just now", "< 1 day",
+    #          "0 days ago", "1 hour ago", "2 hours ago", etc.
+    # Excludes: "< 7 days", "Active", "Live Search", "< 3 days", anything older.
+    import re as _re
+    today_iso = date.today().isoformat()          # e.g. "2026-03-08"
+    today_day = date.today().strftime("%d")       # e.g. "08"
+
+    def _is_posted_today(posted_str):
+        p = posted_str.strip().lower()
+        # Explicit today markers
+        if p in ("today", "just now", "< 1 day", "0 days ago", "posted today"):
+            return True
+        # "X hour(s) ago" → definitely today
+        if _re.match(r"^\d+\s*hours?\s*ago$", p):
+            return True
+        if _re.match(r"^\d+\s*min(ute)?s?\s*ago$", p):
+            return True
+        # ISO date match → "2026-03-08"
+        if p == today_iso:
+            return True
+        # Date strings like "Mar 08, 2026" or "08 Mar 2026"
+        try:
+            from datetime import datetime
+            for fmt in ("%b %d, %Y", "%d %b %Y", "%B %d, %Y", "%d %B %Y", "%Y-%m-%d"):
+                try:
+                    parsed = datetime.strptime(posted_str.strip(), fmt).date()
+                    if parsed == date.today():
+                        return True
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+        return False
+
+    today_jobs = [j for j in internships_sorted if _is_posted_today(j.get("posted", ""))]
+
+    ws_td = wb.create_sheet("🔥 Posted Today", 1)   # insert as 2nd sheet (index 1)
+    ws_td.merge_cells("A1:Q1")
+    ws_td["A1"] = f"🔥 Posted TODAY — {today} — Apply These First! (Freshest listings only)"
+    ws_td["A1"].font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    ws_td["A1"].fill = PatternFill("solid", start_color="C00000")
+    ws_td["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws_td.row_dimensions[1].height = 32
+
+    # Sub-header explanation row
+    ws_td.merge_cells("A2:Q2")
+    ws_td["A2"] = ("⚡ These internships were posted TODAY — apply within hours, not days. "
+                   "Early applicants get 3–5x more callbacks. Sorted by AI Fit Score.")
+    ws_td["A2"].font = Font(name="Arial", italic=True, size=9, color="7F0000")
+    ws_td["A2"].fill = PatternFill("solid", start_color="FFE0E0")
+    ws_td["A2"].alignment = Alignment(horizontal="left", wrap_text=True)
+    ws_td.row_dimensions[2].height = 25
+
+    for col, h in enumerate(headers, 1):
+        cell = ws_td.cell(3, col, h)
+        cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        cell.fill = PatternFill("solid", start_color="C00000")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = thin
+    ws_td.row_dimensions[3].height = 30
+
+    if not today_jobs:
+        ws_td.merge_cells("A4:Q4")
+        ws_td["A4"] = ("No internships with a confirmed 'posted today' date in this run. "
+                       "Most scraped sources show '< 7 days' — check Sheet 1 and sort by Posted column.")
+        ws_td["A4"].font = Font(name="Arial", italic=True, size=10, color="7F7F7F")
+        ws_td["A4"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws_td.row_dimensions[4].height = 40
+    else:
+        for i, job in enumerate(today_jobs, 1):
+            r      = i + 3
+            domain = job.get("domain", "Finance Operations")
+            color  = DOMAIN_COLORS.get(domain, "404040")
+            row_bg = "FFF5F5" if i % 2 != 0 else "FFFFFF"
+            score  = job.get("fit_score", 5)
+            if score >= 9:   score_bg = "C6EFCE"; score_fc = "276221"
+            elif score >= 7: score_bg = "FFEB9C"; score_fc = "9C5700"
+            elif score >= 5: score_bg = "DDEBF7"; score_fc = "1F4E79"
+            else:            score_bg = "FFE0E0"; score_fc = "9C0006"
+
+            values = [i, job["title"], job["company"], job.get("tier", ""),
+                      job["firm_type"], job["domain"],
+                      job["location"], job["stipend"], job["duration"], job["posted"],
+                      job["deadline"], job["platform"], job["link"],
+                      job["status"], f"{score}/10", job.get("fit_reason", ""), ""]
+
+            for col, val in enumerate(values, 1):
+                cell = ws_td.cell(r, col, val)
+                cell.border = thin
+                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                if col == 2:
+                    cell.font = Font(name="Arial", size=9, bold=True, color=color)
+                    cell.fill = PatternFill("solid", start_color=row_bg)
+                elif col == 6:   # Domain
+                    cell.font = Font(name="Arial", size=9, color=color)
+                    cell.fill = PatternFill("solid", start_color=row_bg)
+                elif col == 13:  # Link
+                    cell.font = Font(name="Arial", size=9, color="1558BB", underline="single")
+                    cell.fill = PatternFill("solid", start_color=row_bg)
+                    cell.hyperlink = str(val)
+                elif col == 14:  # Status
+                    cell.font = Font(name="Arial", size=9, bold=True, color="375623")
+                    cell.fill = PatternFill("solid", start_color="E2EFDA")
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col == 15:  # AI Fit Score
+                    cell.font = Font(name="Arial", size=10, bold=True, color=score_fc)
+                    cell.fill = PatternFill("solid", start_color=score_bg)
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col == 16:  # Why It Fits
+                    cell.font = Font(name="Arial", size=8, italic=True, color="404040")
+                    cell.fill = PatternFill("solid", start_color=row_bg)
+                else:
+                    cell.font = Font(name="Arial", size=9)
+                    cell.fill = PatternFill("solid", start_color=row_bg)
+            ws_td.row_dimensions[r].height = 40
+
+    for col, w in enumerate(col_widths, 1):
+        ws_td.column_dimensions[get_column_letter(col)].width = w
+    ws_td.freeze_panes = "A4"
+    ws_td.auto_filter.ref = f"A3:Q{3 + max(len(today_jobs), 1)}"
+    print(f"Posted Today sheet: {len(today_jobs)} listings found.")
+
+    # ── Sheet 3 (was Sheet 2): Top Picks (fit score >= 7) ────────────
     ws_top = wb.create_sheet("🌟 Top Picks")
     ws_top.merge_cells("A1:P1")
     ws_top["A1"] = f"Top Picks for Tanishq — AI Fit Score ≥ 7 — {today}"
@@ -1892,14 +2016,15 @@ DOMAIN BREAKDOWN:
 {domain_lines}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EXCEL HAS 7 SHEETS:
+EXCEL HAS 8 SHEETS:
   Sheet 1 — All Internships (sorted by AI Fit Score, color coded)
-  Sheet 2 — Top Picks (Fit Score 7+, best matches for you)
-  Sheet 3 — 3-Month Internships (short, focused internships)
-  Sheet 4 — 4-Month Internships (slightly longer internships)
-  Sheet 5 — Domain Summary (count per domain + platforms)
-  Sheet 6 — Application Tracker (track your progress)
-  Sheet 7 — LinkedIn Search URLs (direct filtered links)
+  Sheet 2 — 🔥 Posted TODAY (freshest listings only — apply these FIRST!)
+  Sheet 3 — Top Picks (Fit Score 7+, best matches for you)
+  Sheet 4 — 3-Month Internships (short, focused internships)
+  Sheet 5 — 4-Month Internships (slightly longer internships)
+  Sheet 6 — Domain Summary (count per domain + platforms)
+  Sheet 7 — Application Tracker (track your progress)
+  Sheet 8 — LinkedIn Search URLs (direct filtered links)
 
 AI FIT SCORE is based on your resume:
   BBA Finance & Banking | SEBI NISM | McKinsey Forward
@@ -1907,10 +2032,11 @@ AI FIT SCORE is based on your resume:
   Skills: Excel, Power BI, Financial Modeling, Strategy
 
 HOW TO USE:
-  1. Start with Sheet 2 (Top Picks) — highest fit first
-  2. Click Apply Link to go directly to the listing
-  3. Update STATUS column after applying
-  4. Use Sheet 4 to track interview progress
+  1. Start with Sheet 2 (Posted TODAY) — these are the freshest, apply immediately
+  2. Then check Sheet 3 (Top Picks) — highest AI fit score
+  3. Click Apply Link to go directly to the listing
+  4. Update STATUS column after applying
+  5. Use Sheet 7 to track interview progress
 
 Good luck!
 -- Internship Bot v8.0 (GitHub Actions)
