@@ -1,4 +1,5 @@
 import requests
+import urllib3
 import pandas as pd
 import random
 import time
@@ -13,18 +14,30 @@ from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
 from collections import defaultdict
 
+# Suppress the InsecureRequestWarning that fires when verify=False is used.
+# Some job sites (TimesJobs) have broken SSL cert chains on GitHub Actions runners.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 TODAY = datetime.now()
 
 # -------------------------------------------------
 # CONFIG
 # -------------------------------------------------
 
-# BUG 1 FIXED: env var names now match the GitHub Secrets defined in GOOGLE_SHEETS_SETUP.md
-EMAIL      = os.environ.get("EMAIL")       # was "EMAIL_USER" — secret is named "EMAIL"
-EMAIL_PASS = os.environ.get("PASSWORD")    # was "EMAIL_PASS" — secret is named "PASSWORD"
-TO_EMAIL   = os.environ.get("EMAIL")       # send digest to yourself; add EMAIL_TO secret if different
+# These names must EXACTLY match your GitHub Secrets (case-sensitive):
+#   Settings → Secrets and variables → Actions
+#   Secret names: EMAIL, PASSWORD, GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
+EMAIL      = os.environ.get("EMAIL")       # your Gmail address
+EMAIL_PASS = os.environ.get("PASSWORD")    # your Gmail App Password (16 chars)
+TO_EMAIL   = os.environ.get("EMAIL_TO") or os.environ.get("EMAIL")  # defaults to sender
 GSHEET_ID  = os.environ.get("GSHEET_ID")
 SA_JSON    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+# Startup diagnostics — shows in Actions log so you can see exactly what's set
+print(f"[CONFIG] EMAIL     = {'set' if EMAIL else '❌ MISSING'}")
+print(f"[CONFIG] PASSWORD  = {'set' if EMAIL_PASS else '❌ MISSING'}")
+print(f"[CONFIG] TO_EMAIL  = {'set' if TO_EMAIL else '❌ MISSING'}")
+print(f"[CONFIG] GSHEET_ID = {'set' if GSHEET_ID else 'not set (cross-run dedup disabled)'}")
 
 OUTPUT_FILE = "internships.xlsx"
 
@@ -65,13 +78,16 @@ def get_proxy():
 # -------------------------------------------------
 
 def safe_request(url, headers=None):
+    # verify=False: GitHub Actions runners can't verify certain job sites'
+    # SSL cert chains (broken intermediate CA). Warning suppressed above.
     for i in range(2):
         try:
             r = requests.get(
                 url,
                 headers=headers,
                 proxies=get_proxy(),
-                timeout=20
+                timeout=20,
+                verify=False   # FIX: SSL cert verification disabled for CI compatibility
             )
             if r.status_code == 200:
                 return r
@@ -79,7 +95,7 @@ def safe_request(url, headers=None):
                 print(f"[WARN] {url} returned status {r.status_code}")
         except Exception as e:
             print(f"[ERROR] Request failed for {url}: {e}")
-        time.sleep(8)   # was 30 — excessive on CI
+        time.sleep(8)
     return None
 
 # -------------------------------------------------
