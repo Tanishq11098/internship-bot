@@ -12,10 +12,10 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -24,7 +24,6 @@ jobs:
           pip install requests pandas beautifulsoup4 openpyxl gspread google-auth
 
       - name: Run Internship Bot
-        # File name matches v6
         run: python internship_bot_v6.py
         env:
           # These must match your GitHub Secret names EXACTLY (case-sensitive)
@@ -37,7 +36,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Upload Excel artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: internships-${{ github.run_number }}
           path: internships.xlsx
