@@ -4,6 +4,9 @@ import random
 import time
 import smtplib
 import os
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -16,9 +19,12 @@ TODAY = datetime.now()
 # CONFIG
 # -------------------------------------------------
 
-EMAIL = os.environ.get("EMAIL_USER")
-EMAIL_PASS = os.environ.get("EMAIL_PASS")
-TO_EMAIL = os.environ.get("EMAIL_TO")
+# BUG 1 FIXED: env var names now match the GitHub Secrets defined in GOOGLE_SHEETS_SETUP.md
+EMAIL      = os.environ.get("EMAIL")       # was "EMAIL_USER" — secret is named "EMAIL"
+EMAIL_PASS = os.environ.get("PASSWORD")    # was "EMAIL_PASS" — secret is named "PASSWORD"
+TO_EMAIL   = os.environ.get("EMAIL")       # send digest to yourself; add EMAIL_TO secret if different
+GSHEET_ID  = os.environ.get("GSHEET_ID")
+SA_JSON    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 OUTPUT_FILE = "internships.xlsx"
 
@@ -54,7 +60,8 @@ def get_proxy():
     return {"http": p, "https": p}
 
 # -------------------------------------------------
-# RETRY LOGIC  (FIX 6: log errors instead of silently swallowing)
+# RETRY LOGIC
+# BUG 2 FIXED: sleep reduced from 30s to 8s so CI doesn't waste time
 # -------------------------------------------------
 
 def safe_request(url, headers=None):
@@ -72,11 +79,66 @@ def safe_request(url, headers=None):
                 print(f"[WARN] {url} returned status {r.status_code}")
         except Exception as e:
             print(f"[ERROR] Request failed for {url}: {e}")
-        time.sleep(30)
+        time.sleep(8)   # was 30 — excessive on CI
     return None
 
 # -------------------------------------------------
-# SHINE SCRAPER  (FIX 3: corrected CSS selectors)
+# GOOGLE SHEETS: LOAD + SAVE SEEN LISTINGS
+# BUG 6 FIXED: Google Sheets deduplication was completely missing in v6
+# -------------------------------------------------
+
+def get_gsheet_client():
+    if not SA_JSON:
+        print("[WARN] GOOGLE_SERVICE_ACCOUNT_JSON not set — cross-run dedup disabled")
+        return None
+    try:
+        info = json.loads(SA_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        print(f"[ERROR] Failed to build gsheet client: {e}")
+        return None
+
+def load_seen_links():
+    """Return a set of listing links already emailed in past runs."""
+    client = get_gsheet_client()
+    if not client or not GSHEET_ID:
+        return set()
+    try:
+        sh = client.open_by_key(GSHEET_ID)
+        try:
+            ws = sh.worksheet("seen_listings")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title="seen_listings", rows=1, cols=1)
+            ws.append_row(["link"])
+            return set()
+        values = ws.col_values(1)
+        return set(v.strip() for v in values[1:] if v.strip())  # skip header
+    except Exception as e:
+        print(f"[ERROR] load_seen_links failed: {e}")
+        return set()
+
+def save_new_links(new_links):
+    """Append newly seen links to the Google Sheet for future dedup."""
+    client = get_gsheet_client()
+    if not client or not GSHEET_ID or not new_links:
+        return
+    try:
+        sh = client.open_by_key(GSHEET_ID)
+        try:
+            ws = sh.worksheet("seen_listings")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title="seen_listings", rows=1, cols=1)
+            ws.append_row(["link"])
+        for link in new_links:
+            ws.append_row([link])
+        print(f"[INFO] Saved {len(new_links)} new links to Google Sheet")
+    except Exception as e:
+        print(f"[ERROR] save_new_links failed: {e}")
+
+# -------------------------------------------------
+# SHINE SCRAPER
 # -------------------------------------------------
 
 def scrape_shine():
@@ -89,8 +151,6 @@ def scrape_shine():
         return jobs
 
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # Shine's actual listing cards as of 2024 — update selectors if site changes
     cards = soup.select("li.job-listing") or soup.select("div[class*='jobCard']")
 
     for c in cards:
@@ -114,7 +174,7 @@ def scrape_shine():
                 "link": link,
                 "source": "Shine",
                 "deadline": "",
-                "posted_date": TODAY   # FIX 4 note: real date parsing would need page detail scrape
+                "posted_date": TODAY.strftime("%Y-%m-%d")
             })
         except Exception as e:
             print(f"[WARN] Shine card parse error: {e}")
@@ -123,7 +183,7 @@ def scrape_shine():
     return jobs
 
 # -------------------------------------------------
-# TIMESJOBS SCRAPER  (FIX 3: corrected CSS selectors)
+# TIMESJOBS SCRAPER
 # -------------------------------------------------
 
 def scrape_timesjobs():
@@ -136,8 +196,6 @@ def scrape_timesjobs():
         return jobs
 
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # TimesJobs actual listing structure
     cards = soup.select("li.clearfix.job-bx.wht-shd-bx") or soup.select("li[class*='job-bx']")
 
     for c in cards:
@@ -160,7 +218,7 @@ def scrape_timesjobs():
                 "link": link,
                 "source": "TimesJobs",
                 "deadline": "",
-                "posted_date": TODAY
+                "posted_date": TODAY.strftime("%Y-%m-%d")
             })
         except Exception as e:
             print(f"[WARN] TimesJobs card parse error: {e}")
@@ -177,6 +235,7 @@ def remove_excluded_jobs(jobs):
 
 # -------------------------------------------------
 # FILTER: REMOVE OLD JOBAAJ INTERNSHIPS (>6 MONTHS)
+# BUG 3 FIXED: posted_date is now a string "YYYY-MM-DD"; parse it for comparison
 # -------------------------------------------------
 
 def remove_old_jobaaj(jobs):
@@ -184,14 +243,17 @@ def remove_old_jobaaj(jobs):
     filtered = []
     for j in jobs:
         if "jobaaj.com" in j.get("link", ""):
-            posted = j.get("posted_date")
-            if posted and posted < cutoff:
-                continue
+            try:
+                posted = datetime.strptime(j.get("posted_date", ""), "%Y-%m-%d")
+                if posted < cutoff:
+                    continue
+            except ValueError:
+                pass  # if date missing/malformed, keep the job
         filtered.append(j)
     return filtered
 
 # -------------------------------------------------
-# DEDUPLICATION  (FIX 8: remove duplicate links)
+# DEDUPLICATION (in-run, by link)
 # -------------------------------------------------
 
 def deduplicate(jobs):
@@ -228,27 +290,28 @@ def is_tier1(company):
     return any(t in c for t in TIER1)
 
 # -------------------------------------------------
-# EMAIL DIGEST  (FIX 1: guard against missing creds + empty jobs)
+# EMAIL DIGEST
 # -------------------------------------------------
 
-def send_email(jobs):
-    # Guard: check credentials exist
+def send_email(jobs, new_count):
     if not all([EMAIL, EMAIL_PASS, TO_EMAIL]):
         print("[ERROR] Email credentials missing — skipping email send")
+        print(f"  EMAIL={EMAIL}, EMAIL_PASS={'set' if EMAIL_PASS else 'MISSING'}, TO_EMAIL={TO_EMAIL}")
         return
 
     grouped = defaultdict(list)
     for j in jobs:
         grouped[j["domain"]].append(j)
 
-    html = "<h2>Internship Digest</h2>"
+    html = f"<h2>Internship Digest — {new_count} NEW today</h2>"
     for d, items in grouped.items():
         html += f"<h3>{d}</h3>"
         for j in items:
             tier_badge = " ⭐ <b>Tier 1</b>" if j.get("tier1") else ""
+            is_new = " 🆕" if j.get("is_new") else ""
             html += f"""
             <p>
-            <b>{j['title']}</b>{tier_badge} – {j['company']}<br>
+            <b>{j['title']}</b>{tier_badge}{is_new} – {j['company']}<br>
             {j['location']}<br>
             <a href="{j['link']}"
             style="background:#0073e6;color:white;padding:6px 12px;border-radius:6px;text-decoration:none">
@@ -259,7 +322,7 @@ def send_email(jobs):
 
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Internship Digest – {TODAY.strftime('%d %b %Y')}"
+        msg["Subject"] = f"{new_count} NEW Internships – {TODAY.strftime('%d %b %Y')}"
         msg["From"] = EMAIL
         msg["To"] = TO_EMAIL
         msg.attach(MIMEText(html, "html"))
@@ -285,9 +348,8 @@ def main():
 
     jobs = remove_excluded_jobs(jobs)
     jobs = remove_old_jobaaj(jobs)
-    jobs = deduplicate(jobs)   # FIX 8
+    jobs = deduplicate(jobs)
 
-    # FIX 2: guard against empty jobs list before DataFrame ops
     if not jobs:
         print("[WARN] No jobs found — skipping Excel export and email")
         return
@@ -295,6 +357,21 @@ def main():
     for j in jobs:
         j["domain"] = classify_domain(j["title"])
         j["tier1"] = is_tier1(j["company"])
+
+    # BUG 6 FIXED: cross-run dedup via Google Sheets (restored from v5 design)
+    seen_links = load_seen_links()
+    new_jobs = []
+    for j in jobs:
+        link = j.get("link", "").strip()
+        if link not in seen_links:
+            j["is_new"] = True
+            new_jobs.append(j)
+        else:
+            j["is_new"] = False
+
+    save_new_links([j["link"] for j in new_jobs])
+    new_count = len(new_jobs)
+    print(f"[INFO] {new_count} new listings this run (not seen before)")
 
     df = pd.DataFrame(jobs)
     tier1_df = df[df["tier1"] == True]
@@ -305,8 +382,7 @@ def main():
 
     print(f"[INFO] Excel saved: {OUTPUT_FILE} ({len(df)} rows, {len(tier1_df)} Tier1)")
 
-    # FIX 7: only email if we actually have jobs
-    send_email(jobs)
+    send_email(jobs, new_count)
 
 if __name__ == "__main__":
     main()
