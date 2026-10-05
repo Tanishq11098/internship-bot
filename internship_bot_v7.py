@@ -237,22 +237,39 @@ def finalize(j):
 # ------------------------------------------------------------------
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-           "Accept-Language": "en-IN,en;q=0.9"}
+           "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+           "Accept-Language": "en-IN,en;q=0.9",
+           "Upgrade-Insecure-Requests": "1"}
+API_HEADERS = {"User-Agent": "internship-bot/7.1", "Accept": "application/json"}
+BLOCK_RE = re.compile(r"captcha|access denied|cloudflare|enable javascript|unusual traffic|are you a robot|akamai", re.I)
+DIAG = []   # per-request diagnostics, included in the alert email
 
 
-def safe_request(url, retries=2):
-    verify = urlparse(url).hostname not in UNVERIFIED_HOSTS
+def safe_request(url, retries=2, headers=None):
+    pu = urlparse(url)
+    verify = pu.hostname not in UNVERIFIED_HOSTS
+    tag = f"{pu.netloc}{pu.path[:45]}"
     for i in range(retries):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=20, verify=verify)
+            r = requests.get(url, headers=headers or HEADERS, timeout=20, verify=verify)
+            DIAG.append(f"{r.status_code} {tag}")
             if r.status_code == 200:
                 return r
             print(f"[WARN] {url} -> {r.status_code}")
         except Exception as e:
+            DIAG.append(f"ERR {type(e).__name__} {tag}")
             print(f"[ERROR] {url}: {e}")
         if i < retries - 1:
             time.sleep(6)
     return None
+
+
+def log_empty(source, r, soup):
+    title = soup.title.text.strip()[:70] if soup.title else None
+    blocked = bool(BLOCK_RE.search(r.text[:6000]))
+    msg = f"{source}: HTTP 200 but 0 cards | bytes={len(r.text)} | title={title!r} | block_page={blocked}"
+    print(f"[DIAG] {msg}")
+    DIAG.append(msg)
 
 
 def polite_sleep(a=1.5, b=3.5):
@@ -278,6 +295,8 @@ def scrape_shine(slug):
         return jobs
     soup = BeautifulSoup(r.text, "html.parser")
     cards = soup.select("li.job-listing") or soup.select("div[class*='jobCard']") or soup.select("li[class*='job']")
+    if not cards:
+        log_empty("Shine", r, soup)
     for c in cards:
         try:
             t = c.select_one("a[class*='title'], h2, h3")
@@ -303,6 +322,8 @@ def scrape_timesjobs(keyword):
         return jobs
     soup = BeautifulSoup(r.text, "html.parser")
     cards = soup.select("li.clearfix.job-bx.wht-shd-bx") or soup.select("li[class*='job-bx']")
+    if not cards:
+        log_empty("TimesJobs", r, soup)
     for c in cards:
         try:
             a = c.select_one("h2 a")
@@ -318,8 +339,65 @@ def scrape_timesjobs(keyword):
     return jobs
 
 
+def _env_list(name, default):
+    extra = [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
+    return list(dict.fromkeys(default + extra))
+
+
+# Board tokens come from the careers URL: boards.greenhouse.io/<token> or jobs.lever.co/<token>.
+# Starters are unverified; bad tokens just log a 404 in DIAG. Add yours via repo variables
+# ATS_GREENHOUSE / ATS_LEVER (comma-separated).
+GREENHOUSE_BOARDS = _env_list("ATS_GREENHOUSE", ["razorpay"])
+LEVER_BOARDS = _env_list("ATS_LEVER", ["cred"])
+
+
+def html_to_text(s):
+    return BeautifulSoup(html.unescape(s or ""), "html.parser").get_text(" ", strip=True)
+
+
+def make_api_job(title, company, location, link, source, detail):
+    return {"title": title, "company": company, "location": location, "link": link, "source": source,
+            "card_text": location, "detail_text": detail[:5000], "prefetched": True,
+            "found_on": TODAY.strftime("%Y-%m-%d")}
+
+
+def scrape_greenhouse(token):
+    r = safe_request(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true",
+                     retries=1, headers=API_HEADERS)
+    if not r:
+        return []
+    try:
+        data = r.json().get("jobs", [])
+    except ValueError:
+        return []
+    jobs = [make_api_job(d.get("title", ""), token.replace("-", " ").title(),
+                         (d.get("location") or {}).get("name", ""), d.get("absolute_url", ""),
+                         "Greenhouse", html_to_text(d.get("content", ""))) for d in data if d.get("absolute_url")]
+    print(f"[INFO] Greenhouse '{token}': {len(jobs)}")
+    return jobs
+
+
+def scrape_lever(token):
+    r = safe_request(f"https://api.lever.co/v0/postings/{token}?mode=json", retries=1, headers=API_HEADERS)
+    if not r:
+        return []
+    try:
+        data = r.json()
+    except ValueError:
+        return []
+    jobs = [make_api_job(d.get("text", ""), token.replace("-", " ").title(),
+                         (d.get("categories") or {}).get("location", "") or "", d.get("hostedUrl", ""),
+                         "Lever", d.get("descriptionPlain", "")) for d in data if d.get("hostedUrl")]
+    print(f"[INFO] Lever '{token}': {len(jobs)}")
+    return jobs
+
+
 def scrape_all():
     jobs = []
+    for token in GREENHOUSE_BOARDS:
+        jobs += scrape_greenhouse(token)
+    for token in LEVER_BOARDS:
+        jobs += scrape_lever(token)
     for slug, kw in QUERIES:
         jobs += scrape_shine(slug)
         polite_sleep()
@@ -329,6 +407,8 @@ def scrape_all():
 
 
 def fetch_detail(j):
+    if j.get("prefetched"):
+        return
     r = safe_request(j["link"], retries=1)
     if r:
         text = BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True)
@@ -594,13 +674,16 @@ def main():
 
     jobs = scrape_all()
     print(f"[INFO] Total scraped: {len(jobs)}")
+    print("[DIAG] " + " | ".join(DIAG[:40]))
 
     if not jobs:
-        print("[WARN] All scrapers returned 0. Selectors likely broke or the runner is blocked.")
-        send_mail("[Internship Bot] ALERT: scrapers returned 0 results",
+        print("[WARN] All sources returned 0.")
+        send_mail("[Internship Bot] ALERT: all sources returned 0 results",
                   reminders_html(reminders) +
-                  "<p>Every scraper returned zero listings. Check the Actions log; "
-                  "site markup may have changed or the runner IP is blocked.</p>")
+                  "<p>Every source returned zero listings. Diagnostics (HTTP status per request):</p>"
+                  f"<pre>{esc(chr(10).join(DIAG[:40]))}</pre>"
+                  "<p>403/429 or block_page=True means the runner IP is blocked. 200 with 0 cards "
+                  "means the page is JavaScript-rendered or the markup changed.</p>")
         return
 
     # in-run dedup + exclusions
